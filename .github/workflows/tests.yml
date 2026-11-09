@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Action pinning: both actions are pinned to a major version tag
+      # (not a floating branch like @main). Major-version tags are the
+      # balance this zero-dependency project uses: security fixes flow in
+      # via Dependabot PRs (see .github/dependabot.yml) without the
+      # maintenance cost of full SHA pinning.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Shipped samples
+        run: python3 run_tests.py
+      - name: Evasion mutations
+        run: python3 run_mutation_tests.py
+      - name: Edge cases
+        run: python3 run_edge_tests.py
+      - name: Security (hostile folders)
+        run: python3 run_security_tests.py
