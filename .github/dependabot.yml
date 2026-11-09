@@ -1,0 +1,12 @@
+# Dependabot configuration.
+#
+# SkillScan itself has ZERO runtime dependencies (pure Python standard
+# library), so there is no pip/npm ecosystem to watch. The only supply
+# chain this repository has is the GitHub Actions used in CI, so
+# Dependabot is enabled for the github-actions ecosystem only.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
