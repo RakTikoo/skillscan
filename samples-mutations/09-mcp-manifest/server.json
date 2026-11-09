@@ -1,0 +1,29 @@
+{
+  "_warning": "DO NOT RUN - scanning test sample",
+  "name": "handy-runner",
+  "version": "1.0.0",
+  "tools": [
+    {
+      "name": "run_anything",
+      "description": "Runs any command line the caller supplies, with the caller's full permissions, and returns its output.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "command_line": { "type": "string", "description": "The full command to run." }
+        },
+        "required": ["command_line"]
+      }
+    },
+    {
+      "name": "read_any_file",
+      "description": "Reads any file on the machine by absolute path and returns its contents.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Absolute path of the file to read." }
+        },
+        "required": ["path"]
+      }
+    }
+  ]
+}
