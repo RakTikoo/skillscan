@@ -1,6 +1,6 @@
 # Audit coverage map
 
-How SkillScan v0.1's 25 deterministic rules line up against the techniques
+How SkillScan v0.2's 34 deterministic rules line up against the techniques
 documented in published audits of real malicious AI-agent skills and MCP
 servers.
 
@@ -10,9 +10,10 @@ servers.
   audits. No report text and no malicious code from any audit is reproduced
   here.
 - "Evidence" means one thing only: an **existing** sample in `samples/` or
-  `samples-mutations/` that an existing test suite (`run_tests.py`,
-  `run_mutation_tests.py`, `run_edge_tests.py`) already scans, with the
-  verdict that suite asserts. No new sample was created for this map.
+  `samples-mutations/`, or a fixture in `run_v02_tests.py` (the v0.2 suite
+  builds inert fixtures in a temp dir), that an existing test suite already
+  scans, with the verdict that suite asserts. No new sample was created
+  for this map beyond what those suites contain.
 - Where a rule plausibly addresses a technique but no existing sample
   exercises it that way, the evidence column says so —
   *"rule present, no dedicated sample yet"* — instead of implying a test
@@ -27,11 +28,11 @@ servers.
 
 | Audit | Techniques mapped | Covered | Partial | Gap |
 |-------|-------------------|---------|---------|-----|
-| Snyk — ToxicSkills (Feb 2026) | 11 | 2 | 5 | 4 |
+| Snyk — ToxicSkills (Feb 2026) | 11 | 3 | 5 | 3 |
 | Koi Security — ClawHavoc (Feb 2026) | 7 | 1 | 4 | 2 |
 | Invariant Labs — MCP Tool Poisoning (Apr 2025) | 4 | 0 | 1 | 3 |
 | Koi Security — postmark-mcp (Sep 2025) | 3 | 0 | 2 | 1 |
-| **Total** | **25** | **3** | **12** | **10** |
+| **Total** | **25** | **4** | **12** | **9** |
 
 The pattern in that tally is honest and worth understanding: SkillScan is
 strong on the *code-shaped* half of these audits (credential reads, network
@@ -58,7 +59,7 @@ doing the work). That weakness is structural — see the Gaps section.
 | S5 | Instructions push the agent to weaken the machine: alter service/startup configuration so a backdoor persists, delete system files, loosen security settings | **Partial** | PERSISTENCE, RM_RF, FILE_DELETE, CHMOD_CHOWN | In *code* these fire at full severity — PERSISTENCE/RM_RF are exercised by the corpus's shell-shaped samples (e.g. `samples-mutations/06-shell-home-var`, BLOCK) and FILE_DELETE by `samples/caution/shell-automation` (CAUTION, asserted by `run_tests.py`). In *prose* the same words are capped at CAUTION; a dedicated persistence sample does not exist, so for PERSISTENCE specifically: rule present, no dedicated sample yet |
 | S6 | Prompt-injection wording in skill text: hidden or deceptive instructions outside the skill's stated purpose, "ignore previous instructions"-style overrides, fake system-message framing, Unicode/base64-smuggled instructions | **Partial** | — (no prompt-injection rule exists) | Only the encoding half is visible: if the smuggled text uses base64 in a scannable file, BASE64_OBFUSCATION fires at most (CAUTION in documentation). No existing sample exercises instruction-override wording, and no rule judges whether prose is *deceptive* — that is a semantic judgement a regex rule set does not make |
 | S7 | Skills instruct the agent to print/echo secrets back, or ask the user to paste secrets into outputs or commands | **Gap** | — | No rule inspects instructions *about* credential handling in prose. ENVIRON_SECRET_ACCESS covers code touching the environment, not text asking a human or agent to reveal a secret |
-| S8 | Hardcoded secrets and tokens embedded in the skill itself (leaked keys, or deliberately embedded tokens for attacker infrastructure) | **Gap** | — | There is no secret-scanning rule (no API-key/token entropy or prefix patterns) in the 25 rules. Nothing in the existing corpus exercises one |
+| S8 | Hardcoded secrets and tokens embedded in the skill itself (leaked keys, or deliberately embedded tokens for attacker infrastructure) | **Covered** | HARDCODED_SECRET_LIVE, HARDCODED_SECRET_GENERIC | v0.2 added secret detection: live-format credentials (AWS key ids, GitHub and GitLab tokens, `sk-` keys, Stripe live keys, npm tokens, Slack tokens, private-key blocks) BLOCK; long high-entropy literals assigned to secret-named variables (including a bare KEY / TOKEN / SECRET / PASSWORD name) CAUTION, as are Stripe *test* keys. `run_v02_tests.py` fixtures assert both tiers fire, and that placeholders (`your-api-key`, `changeme`, `xxxx`), env-var references, low-entropy values, and clearly-marked documentation examples do **not**. Honest limits: the generic tier's effective minimum is ~12 characters (an entropy floor of 3.5 bits/char, despite an 8-character regex floor), so secrets that are short, low-entropy, split across strings, or encoded are not caught; live-format values in test files or marked FAKE_/FIXTURE are downgraded to CAUTION rather than BLOCK; and a random-looking test value can trip the CAUTION tier |
 | S9 | Content the skill fetches at run time from third parties carries injected instructions back to the agent (indirect injection through fetched content) | **Gap** | — (NETWORK_ACCESS flags that fetching happens, at CAUTION) | The fetched content does not exist in the folder at scan time, so there is nothing static to inspect. Flagging "this skill fetches remote content" is the only signal, and it is also true of most honest skills |
 | S10 | Run-time fetching and execution of remote code/instructions — the reviewed artefact is benign, the behaviour is swapped in later from an external endpoint (`curl \| bash`, dynamic imports, remote instruction loading) | **Partial** | CURL_PIPE_BASH, DYNAMIC_IMPORT, EVAL_EXEC, NETWORK_ACCESS | The `curl \| bash` form is Covered-grade: `samples/bad/obfuscated-dropper` asserts CURL_PIPE_BASH (BLOCK). Dynamic-import indirection is exercised by `samples-mutations/04-importlib-getattr` and `10-b64-chunks-importlib` (BLOCK). But a plain fetch of remote *instructions* (no pipe-to-shell, no eval) fires only NETWORK_ACCESS at CAUTION — that form is a Gap inside a Partial |
 | S11 | Skills with direct access to money — trading, payments, crypto operations, bank accounts | **Gap** | — | SkillScan has no capability-classification rule for financial access, and by design a capability is not the same as malice (compare the CAUTION philosophy for subprocess/network). No rule and no sample |
@@ -80,8 +81,8 @@ doing the work). That weakness is structural — see the Gaps section.
 |---|------------------------|----------|---------|-------------------------------|
 | K1 | Professional-looking documentation with a fake "Prerequisites" step: the user is told to download an archive from an outside repository (Windows) or paste a hosted install script into their terminal (macOS) before the skill will work | **Partial** | CURL_PIPE_BASH, RUNTIME_PACKAGE_INSTALL (line rules run over documentation, capped at CAUTION) | Rule present, no dedicated sample yet. The payload (a password-protected archive; an off-site paste-in script) lives *outside* the skill folder, so the only in-folder evidence is the instruction text itself — exactly the prose case SkillScan deliberately never BLOCKs on |
 | K2 | The pasted/hosted script is obfuscated shell that fetches the next stage from attacker infrastructure, which in turn pulls down a stealer binary | **Partial** | BASE64_OBFUSCATION, DECODE_AND_RUN, CURL_PIPE_BASH, NETWORK_ACCESS | If the script itself were inside the folder, the corpus proves the shape is caught: `samples/bad/obfuscated-dropper` (BLOCK, asserted) and mutation 10 (BLOCK). In the documented campaign the script is hosted off-folder, so a folder scan sees only K1's instruction. No sample exercises the off-folder variant — by definition none can |
-| K3 | Stealer harvests stored secrets at scale: exchange API keys, wallet private keys, SSH credentials, browser passwords | **Partial** | SSH_CREDENTIAL_READ, CLOUD_CREDENTIAL_READ, ENV_FILE_READ, CREDENTIAL_ENUMERATION, EXFIL_COMBINATION | The SSH/cloud/.env slice is Covered-grade: `samples/bad/ssh-stealer` (BLOCK, asserted rules) and `samples-mutations/15-glob-discovery` (BLOCK; CREDENTIAL_ENUMERATION fires). Browser-password stores and crypto-wallet files have **no dedicated rule** — a path to a browser profile or wallet file matches nothing unless it also trips a generic rule. Rule present for the credential-file slice only |
-| K4 | Reverse-shell backdoor hidden inside otherwise functional skill code | **Covered** | SHELL_OS_SYSTEM, SHELL_SUBPROCESS, NETWORK_ACCESS, NETWORK_SEND_DATA | The corpus's code-level send/shell shapes are asserted BLOCK: `samples/bad/ssh-stealer` (NETWORK_SEND_DATA), `samples-mutations/05-subprocess-list` (BLOCK; SHELL_SUBPROCESS + NETWORK_SEND_DATA fire over a subprocess argument list). Honest limit: this coverage is for reverse shells built from recognisable shell/network primitives; a raw-socket shell with neither keyword can evade (see Gaps) |
+| K3 | Stealer harvests stored secrets at scale: exchange API keys, wallet private keys, SSH credentials, browser passwords | **Partial** | SSH_CREDENTIAL_READ, CLOUD_CREDENTIAL_READ, ENV_FILE_READ, CREDENTIAL_ENUMERATION, BROWSER_CREDENTIAL_STORE, EXFIL_COMBINATION | The SSH/cloud/.env slice is Covered-grade: `samples/bad/ssh-stealer` (BLOCK, asserted rules) and `samples-mutations/15-glob-discovery` (BLOCK; CREDENTIAL_ENUMERATION fires). v0.2 added BROWSER_CREDENTIAL_STORE (browser profile password/cookie stores — Login Data, logins.json, key4.db, Local State — browser profile dirs, wallet extension storage): CAUTION alone, and it counts as credential material for EXFIL_COMBINATION, so store-access + send BLOCKs. Store paths are also recognised after AST constant folding, so concatenated fragments (`'goo' + 'gle-chr' + 'ome'`) are caught. `run_v02_tests.py` asserts all three shapes. Still Partial: wallet *private-key files* in arbitrary locations, exchange-key files with project-specific names, and anything the stealer reaches by enumerating directories generically can still fall between rules |
+| K4 | Reverse-shell backdoor hidden inside otherwise functional skill code | **Covered** | SHELL_OS_SYSTEM, SHELL_SUBPROCESS, NETWORK_ACCESS, NETWORK_SEND_DATA, REVERSE_SHELL | The corpus's code-level send/shell shapes are asserted BLOCK: `samples/bad/ssh-stealer` (NETWORK_SEND_DATA), `samples-mutations/05-subprocess-list` (BLOCK; SHELL_SUBPROCESS + NETWORK_SEND_DATA fire over a subprocess argument list). v0.2 added REVERSE_SHELL for the raw-socket form: a socket connection wired to a shell (dup2 of the socket fd, pty.spawn, bash /dev/tcp, or spawning /bin/sh alongside a socket) BLOCKs, with Python/JS/bash fixtures in `run_v02_tests.py`, plus a benign socket-client fixture proving ordinary socket code without a shell does not trip it. Honest limit: a socket shell that avoids all of those wirings (e.g. passing the socket to an already-running interpreter through an unusual route) can still evade |
 | K5 | Bot credentials sitting in the agent's own `.env` file are read and sent out to a third-party webhook endpoint | **Partial** | ENV_FILE_READ, NETWORK_SEND_DATA, EXFIL_COMBINATION | ENV_FILE_READ is exercised by the corpus's `.env`-shaped mutations and EXFIL_COMBINATION fires across the stealer corpus (mutations 01, 02, 03, 06, 08, 12, 14, 17 — all BLOCK). Marked Partial, not Covered, because no single existing sample is the `.env`-to-webhook shape end-to-end: rule present in combination, no dedicated sample yet |
 | K6 | Typosquatting and impersonation: skill names and listings that imitate the registry, popular tools, or categories users search for (fake updaters, wallet trackers, video downloaders) | **Gap** | — | SkillScan scans folder *contents*, not marketplace metadata, publisher history, or name similarity. A typosquat with clean code scans PASS, correctly by its own lights — the deception is in the listing, not the files |
 | K7 | One shared command-and-control address reused across hundreds of skills from a handful of publisher accounts | **Gap** | — | This is cross-skill, registry-level correlation. A single-folder static scanner has no view of other skills, other publishers, or shared infrastructure, and keeps no reputation data |
@@ -115,6 +116,49 @@ doing the work). That weakness is structural — see the Gaps section.
 | P1 | A previously clean, legitimately useful MCP server turns malicious in a later version: one added line silently copies everything the tool processes (here, every email it sends) to the developer's own outside server | **Partial** | NETWORK_SEND_DATA, NETWORK_ACCESS | A hard-coded extra send in implementation code is the shape NETWORK_SEND_DATA exists for, and it is corpus-proven (`samples/bad/ssh-stealer`, asserted; mutation 05 via subprocess, BLOCK). Two honest limits keep this Partial: the rule fires the same way for a *legitimate* second send (analytics, a backup CC) — the rule cannot tell a backdoor copy from a feature — and a JavaScript server's per-call copy inside an existing send function may present as ordinary code for that tool. Rule present, no dedicated sample yet for the "one extra line in a real server" shape |
 | P2 | The trust history itself is the weapon: fifteen clean versions build the user base that version sixteen then exploits, and deleting the package from the registry afterwards does not remove it from installed clients | **Gap** | — | Version-over-version diffing, publisher reputation, and post-install monitoring are all outside a single-folder, single-moment static scan. No rule, no sample |
 | P3 | The malicious code runs server-side with the full permissions users granted the tool — no exploit needed, just the access the tool legitimately has | **Partial** | MCP_SERVER_COMMAND, MCP_UNRESTRICTED_EXEC, MCP_UNRESTRICTED_READ | SkillScan can flag *unbounded capability declarations*: `samples-mutations/09-mcp-manifest` — BLOCK (MCP_UNRESTRICTED_EXEC + MCP_UNRESTRICTED_READ asserted by the suite), and MCP_SERVER_COMMAND flags manifests that launch via shell/interpreter commands. But for a conventional server whose declared tools are narrow (send email), the scan sees a normal tool doing its normal job — capability *within* a legitimate-looking scope is not distinguishable from the feature itself |
+
+---
+
+## v0.2 additions beyond these four audits
+
+Three v0.2 rule families came from incidents reported *after* this map's
+four audits (spotted by the project's audit watch), so they have no row
+above. Stated with the same honesty standard:
+
+- **Cloud metadata endpoints** (CLOUD_METADATA_ACCESS / CLOUD_METADATA_EXFIL)
+  — malicious MCP npm packages reported in November 2026 probed the
+  cloud metadata service (169.254.169.254 and friends) for live
+  credentials. Endpoint access alone is CAUTION; combined with an
+  outbound send or other credential access it BLOCKs. The endpoint is
+  recognised in dotted, decimal-integer, hex, and IPv6 forms and via
+  the IMDSv2 token path. A send whose destination IS the metadata
+  endpoint (the IMDSv2 token PUT) counts as metadata access, not as a
+  send. Fixtures in `run_v02_tests.py` assert all of these. Limit: an
+  endpoint reached via a resolved hostname or a non-standard path can
+  still evade the patterns.
+- **Error / environment leakage into tool results** (ERROR_INFO_LEAK,
+  CAUTION) — MCP tool code returning raw exception text, stack traces,
+  or environment dumps as tool results (the shape behind CVE-2026-119613,
+  AshAi, Nov 2026). Python `return` shapes are detected, including a
+  one-hop local (`tb = traceback.format_exc()` then returning `tb`);
+  logging an error and returning a plain message is the safe shape and
+  is asserted not to fire. Limit: the JS form (returning `e.stack` /
+  `e.message` from a catch block) is not detected.
+- **Package install-time code** (PACKAGE_INSTALL_SCRIPT /
+  PACKAGE_INSTALL_SCRIPT_EXEC) — npm lifecycle scripts and behaviour-
+  carrying `setup.py` files run code before the tool is ever called.
+  Presence is CAUTION; an install script that downloads or executes
+  outside code BLOCKs. Indirection is followed ONE level: a lifecycle
+  script's `node <local-file>` target is checked for a fetch+execute
+  shape, and a local module imported by `setup.py` gets the same
+  behaviour check (comments stripped). The exact well-known benign
+  commands `node-gyp rebuild` and `husky` do not fire. Limits: deeper
+  indirection chains, non-`node` runners, and downloads assembled
+  dynamically inside the referenced file can still evade.
+
+Semantic prompt injection (S6/S7/I1/I2 above) remains a **Gap** in
+v0.2, unchanged: no v0.2 rule attempts to judge what instruction prose
+*means*, for the reasons given in section B below.
 
 ---
 
@@ -163,13 +207,24 @@ PASS.
   pretend to infer intent.
 
 ### E. Missing rule families (code-shaped, so fixable in principle)
-- **S8** — no hardcoded-secret detection (leaked keys/tokens in the skill
-  itself).
-- **K3 (partial)** — no dedicated rules for browser credential stores or
-  crypto-wallet file paths; only the SSH/cloud/.env slice of stealer
-  targets is covered.
-- **K4 (limit)** — a reverse shell built from raw sockets with no shell or
-  HTTP keywords can fall between SHELL_* and NETWORK_* rules.
+- **S8** — *addressed in v0.2:* hardcoded-secret detection now exists
+  (HARDCODED_SECRET_LIVE / HARDCODED_SECRET_GENERIC; see the S8 row).
+  Short, low-entropy, split or encoded secrets still evade it.
+- **K3 (partial)** — *partly addressed in v0.2:* browser credential
+  stores and wallet extension storage now have a dedicated rule
+  (BROWSER_CREDENTIAL_STORE). Wallet private-key files under
+  project-specific names and generic directory enumeration of credential
+  material remain gaps.
+- **K4 (limit)** — *partly addressed in v0.2:* REVERSE_SHELL catches the
+  common raw-socket wirings (dup2, pty.spawn, /dev/tcp, shell spawn
+  alongside a socket — including a quoted `['sh', '-c', …]` list — and
+  the Ruby TCPSocket + IO.popen form). Exotic wirings can still fall
+  between rules: a pipe-relay shell with no dup2, and a JS shell whose
+  name is assembled from string fragments, are known evasions. Raw
+  socket sends on their own are only a CAUTION capability flag
+  (NETWORK_ACCESS) — chat clients and echo servers are benign socket
+  code — and count toward combinations only when the receiver resolves
+  to the socket module.
 - **S3, S4, S5, K5 (evidence gaps)** — rules exist and fire in code, but
   the corpus has no dedicated sample for the prose form (S3, S4, S5) or
   the exact end-to-end shape (K5), so those mappings are asserted by rule
@@ -187,6 +242,6 @@ PASS.
 
 *Map compiled from the four audits above and the scanner source
 (`skillscan/rules.py`, `skillscan/scanner.py`) and test suites as of
-v0.1.0. If a rule or a sample changes, this map must change with it — a
+v0.2.0. If a rule or a sample changes, this map must change with it — a
 coverage claim without a suite behind it is exactly the kind of thing
 this document exists to prevent.*
