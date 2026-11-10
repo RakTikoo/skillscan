@@ -57,8 +57,17 @@ cd skillscan
 python3 -m skillscan <path-to-skill-folder>              # text report
 python3 -m skillscan <path-to-skill-folder> --format md   # Markdown report
 python3 -m skillscan <path-to-skill-folder> --format json # machine-readable
+python3 -m skillscan <path-to-skill-folder> --format sarif # SARIF 2.1.0 (toolchains)
+python3 -m skillscan https://github.com/<owner>/<repo>   # clone + scan a repo
 python3 skillscan.py <path-to-skill-folder>               # shim, same thing
 ```
+
+Repo URLs: only `https://github.com/<owner>/<repo>` is accepted.
+SkillScan shallow-clones it into a temp dir (redirect-following
+disabled), scans, and deletes the clone. Requires `git` on `PATH`.
+npm package folders (`package.json`) and Python package folders
+(`setup.py` / `pyproject.toml`) scan like any other folder, with
+extra install-time checks (see the rules table).
 
 How scanning works:
 
@@ -81,7 +90,9 @@ How scanning works:
 - Documentation (`.md`, `.txt`, `.yaml`, …) is treated as documentation:
   findings there are capped at CAUTION, and lines that *warn against* a
   pattern ("never reads `~/.ssh`") are recognised as safety documentation,
-  not behaviour.
+  not behaviour. Cursor rules (`.cursorrules`, `.cursor/rules/*.mdc`) and
+  other agent config/instruction files get the same documentation
+  treatment.
 - Findings are aggregated per rule per file, with a count.
 - Scanned code is **never executed** — files are only read and parsed.
 
@@ -102,9 +113,22 @@ cannot be a clean PASS (`SCAN_INCOMPLETE`).
 
 The exit codes make SkillScan usable as a CI / install-time gate.
 
+## Toolchain integration
+
+See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full guide:
+
+- **GitHub Action** — the composite action in [`action.yml`](action.yml)
+  (`path`, `fail-on-block`, `format`, `python-version` inputs;
+  `verdict` / `exit-code` outputs) runs SkillScan in CI.
+- **SARIF** — `--format sarif` emits SARIF 2.1.0 for GitHub code
+  scanning, IDEs, and other static-analysis tooling.
+- **Pre-install hook** — [`hooks/pre-install-scan.sh`](hooks/pre-install-scan.sh)
+  scans a folder before install and exits with the scanner's code, so
+  installer wrappers can gate on it.
+
 ## Rules
 
-25 deterministic rules. Any block-severity hit makes the verdict BLOCK;
+34 deterministic rules. Any block-severity hit makes the verdict BLOCK;
 otherwise any caution hit makes it CAUTION; otherwise PASS.
 
 | Rule | Severity | What it catches |
@@ -133,6 +157,15 @@ otherwise any caution hit makes it CAUTION; otherwise PASS.
 | MCP_UNRESTRICTED_EXEC | block | MCP manifest tool that runs arbitrary caller-supplied commands with no constraint |
 | MCP_UNRESTRICTED_READ | caution | MCP manifest tool that reads arbitrary files by unconstrained path |
 | MCP_SERVER_COMMAND | caution | MCP manifest that starts its server via a shell/interpreter/package-runner command |
+| HARDCODED_SECRET_LIVE | block | A credential in an unambiguous live format in the code: AWS key id (`AKIA…`), GitHub token (`ghp_…`, `github_pat_…`), `sk-` API key, Slack token, or a private-key block (placeholders and marked documentation examples are not flagged) |
+| HARDCODED_SECRET_GENERIC | caution | A long, high-entropy literal assigned to a password/secret/token variable (env-var references and obvious placeholders are not flagged) |
+| CLOUD_METADATA_ACCESS | caution | References a cloud metadata endpoint (`169.254.169.254`, `169.254.170.2`, `metadata.google.internal`, `/latest/meta-data/`) — a source of live cloud credentials |
+| CLOUD_METADATA_EXFIL | block | Touches a cloud metadata endpoint **and** reads credential material or has a network send channel |
+| BROWSER_CREDENTIAL_STORE | caution | Touches browser/wallet credential storage (`Login Data`, `logins.json`, `key4.db`, `Local State`, browser profile dirs, wallet extension storage); counts as credential material for EXFIL_COMBINATION |
+| REVERSE_SHELL | block | A raw socket wired to a shell (`dup2` of the socket fd, `pty.spawn`, `/dev/tcp`, or spawning `/bin/sh` alongside a socket) |
+| ERROR_INFO_LEAK | caution | Returns raw exception text, a stack trace, or an environment dump as a tool result (logging the error and returning a plain message is not flagged) |
+| PACKAGE_INSTALL_SCRIPT | caution | Package runs code at install time: an npm lifecycle script (`preinstall`/`install`/`postinstall`/`prepare`) or a `setup.py` that reaches for subprocess/network/sockets |
+| PACKAGE_INSTALL_SCRIPT_EXEC | block | An install-time script downloads or executes outside code (curl/wget, pipe-to-shell, encoded payload, remote fetch) |
 | SCAN_INCOMPLETE | caution | Some content could not be scanned, or nothing was scanned — the verdict is partial |
 
 Every rule ships with a plain-English reason in the report, so a
@@ -173,6 +206,18 @@ challenges it, by design of static analysis:
   *should* be flagged for subprocess + deletion, a weather skill for
   network + an env API key. `expanduser()` on a user-supplied path is
   currently flagged as home access — a known over-broad caution.
+- **Secret detection is heuristic.** The live-format tier needs the
+  complete token in one place; the generic tier's regex floor is an
+  8-character value, but its entropy requirement (≥3.5 bits per
+  character over at least 6 distinct characters) puts the *effective*
+  minimum at roughly 12 characters — so short, weak, split or encoded
+  secrets evade it, and a random-looking *test* value can trip the
+  CAUTION tier. Live-format values in test files or next to FAKE_ /
+  FIXTURE markers are downgraded to CAUTION, not blocked. Placeholders
+  and marked examples are suppressed, but suppression is substring-based.
+- **Metadata / reverse-shell rules are shape-based.** A metadata
+  endpoint reached through a resolved hostname or non-standard path, or
+  a socket shell wired in an unusual way, can evade them.
 - **MCP coverage is structural for common manifest shapes** (`tools[]`,
   `mcpServers`) — exotic manifest layouts may only get text-level rules.
 - **Scan budgets are finite.** A scan stops after 2,000 files or 32 MB
@@ -219,21 +264,22 @@ python3 run_tests.py           # shipped samples
 python3 run_mutation_tests.py  # 17 evasion mutations — all must BLOCK
 python3 run_edge_tests.py      # FIFO hang, oversize, empty, usage codes, UTF-16
 python3 run_security_tests.py  # hostile folders vs the scanner itself (see below)
+python3 run_v02_tests.py       # v0.2: secrets, metadata, browser stores, reverse shells, error leaks, npm/PyPI targets, Cursor rules, repo URLs, SARIF, Action + hook (fixtures are inert and built in a temp dir)
 ```
 
 ## Coverage against published audits
 
 [`docs/AUDIT_COVERAGE.md`](docs/AUDIT_COVERAGE.md) maps 25 techniques
 from four published audits of real malicious skills / MCP servers
-against the 25 rules above. Summary (Covered / Partial / Gap per audit):
+against the 34 rules above. Summary (Covered / Partial / Gap per audit):
 
 | Audit | Covered | Partial | Gap |
 |-------|---------|---------|-----|
-| Snyk — ToxicSkills, Feb 2026 (3,984 skills scanned) | 2 | 5 | 4 |
+| Snyk — ToxicSkills, Feb 2026 (3,984 skills scanned) | 3 | 5 | 3 |
 | Koi Security — ClawHavoc, Feb 2026 (341 malicious skills) | 1 | 4 | 2 |
 | Invariant Labs — MCP Tool Poisoning, Apr 2025 | 0 | 1 | 3 |
 | Koi Security — postmark-mcp backdoor, Sep 2025 | 0 | 2 | 1 |
-| **Total (25 techniques)** | **3** | **12** | **10** |
+| **Total (25 techniques)** | **4** | **12** | **9** |
 
 The honest pattern: SkillScan is strong on the *code-shaped* half of
 these audits (credential reads, network exfiltration, decode-and-run
@@ -252,8 +298,11 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 RakTikoo.
 
 ## Status
 
-v0 spike (Week 1 prototype), hardened by adversarial review. Expect
-false positives and false negatives; the rule set and corpus are the
-starting point, not the finished product. Issues and new evasion
-samples are welcome — a mutation that evades SkillScan is a valuable
-contribution.
+v0.2. v0.1 was a Week 1 spike hardened by adversarial review; v0.2 adds
+secret detection, cloud-metadata and browser-store rules, raw-socket
+reverse-shell detection, error-leak detection, npm/PyPI package
+targets, Cursor-rules handling, repo-URL scanning, SARIF output, and
+toolchain integration (GitHub Action + pre-install hook). Expect false
+positives and false negatives; the rule set and corpus are the starting
+point, not the finished product. Issues and new evasion samples are
+welcome — a mutation that evades SkillScan is a valuable contribution.
