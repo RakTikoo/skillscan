@@ -123,6 +123,7 @@ def render_sarif(result: ScanResult) -> str:
             "properties": {
                 "security-severity": "8.0" if rule.severity == "block" else "5.0",
                 "tags": ["security"],
+                "owasp": rule.owasp,
             },
         })
     results = []
