@@ -1,0 +1,28 @@
+{
+  "code": "tr",
+  "language": "Turkish",
+  "cjk": false,
+  "override": [
+    "önceki talimatları yok say",
+    "önceki talimatları görmezden gel",
+    "tüm talimatları yok say"
+  ],
+  "send": [
+    "gönder",
+    "çal",
+    "yükle"
+  ],
+  "target": [
+    "parola",
+    "şifre",
+    "kimlik bilgilerini",
+    "anahtar",
+    "token",
+    ".ssh"
+  ],
+  "conceal": [
+    "kullanıcıya söyleme",
+    "kullanıcıya söylemeden",
+    "kullanıcıdan gizle"
+  ]
+}
