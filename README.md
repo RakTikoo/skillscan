@@ -328,6 +328,9 @@ only. Full methodology, counting rules and caveats:
 | Malicious | 7,421 | **45.9%** (3,409) | 35.8% (2,659) | 18.2% (1,353) |
 | Benign | 2,235 | 0.67% false BLOCKs (15) | 25.9% (578) | 73.5% (1,642) |
 
+Detection at BLOCK+CAUTION (flagged at any severity): **81.8%** of
+malicious skills; 26.5% of benign skills were flagged at any severity.
+
 Detection by attack family (multi-label membership; BLOCK /
 BLOCK+CAUTION):
 
