@@ -1,0 +1,79 @@
+name: "SkillScan"
+description: "Scan an AI-agent skill or MCP server folder for known-bad patterns (credential reads, exfiltration shapes, hardcoded secrets, install-time code) before it is installed or merged."
+author: "RakTikoo"
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  path:
+    description: "Folder to scan (skill, MCP server, npm package, or repo checkout), relative to the workspace."
+    required: true
+    default: "."
+  fail-on-block:
+    description: "Fail the job when the verdict is BLOCK. CAUTION never fails the job."
+    required: false
+    default: "true"
+  format:
+    description: "Report format printed to the log: text, json, md, or sarif."
+    required: false
+    default: "text"
+  python-version:
+    description: "Python version to run the scanner with."
+    required: false
+    default: "3.12"
+
+outputs:
+  verdict:
+    description: "The scan verdict: PASS, CAUTION, or BLOCK."
+    value: ${{ steps.scan.outputs.verdict }}
+  exit-code:
+    description: "The scanner exit code (0 PASS, 1 CAUTION, 2 BLOCK, 3 usage/IO error)."
+    value: ${{ steps.scan.outputs.exit-code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Run SkillScan
+      id: scan
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        SCAN_FORMAT: ${{ inputs.format }}
+        FAIL_ON_BLOCK: ${{ inputs.fail-on-block }}
+      run: |
+        set +e
+        # JSON is captured for the verdict outputs; the chosen format is
+        # what gets printed to the job log.
+        python3 "${{ github.action_path }}/skillscan.py" "$SCAN_PATH" --format json > skillscan-report.json
+        code=$?
+        python3 "${{ github.action_path }}/skillscan.py" "$SCAN_PATH" --format "$SCAN_FORMAT"
+        verdict=$(python3 -c "import json; print(json.load(open('skillscan-report.json'))['verdict'])" 2>/dev/null || echo "ERROR")
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        echo "SkillScan verdict: $verdict (exit $code)"
+        fail_on_block=$(printf '%s' "$FAIL_ON_BLOCK" | tr '[:upper:]' '[:lower:]')
+        if [ "$code" -eq 1 ]; then
+          echo "::warning::SkillScan verdict is CAUTION — read the findings before merging."
+          exit 0
+        fi
+        if [ "$code" -eq 0 ]; then
+          exit 0
+        fi
+        if [ "$code" -eq 2 ]; then
+          if [ "$fail_on_block" = "true" ]; then
+            echo "::error::SkillScan verdict is BLOCK and fail-on-block is true."
+            exit 1
+          fi
+          exit 0
+        fi
+        # Catch-all: exit 3 (usage / IO error) and ANY other unexpected
+        # code mean the scan did not run — fail the job loudly rather
+        # than letting a broken scan read as a pass.
+        echo "::error::SkillScan could not run (exit $code)."
+        exit 1
