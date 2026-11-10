@@ -1,0 +1,32 @@
+{
+  "code": "pl",
+  "language": "Polish",
+  "cjk": false,
+  "override": [
+    "ignoruj poprzednie instrukcje",
+    "zignoruj poprzednie instrukcje",
+    "ignoruj wszystkie instrukcje"
+  ],
+  "send": [
+    "wyślij",
+    "wyslij",
+    "ukradnij",
+    "prześlij",
+    "przeslij"
+  ],
+  "target": [
+    "hasło",
+    "hasla",
+    "poświadczenia",
+    "poswiadczenia",
+    "klucz",
+    "token",
+    ".ssh"
+  ],
+  "conceal": [
+    "nie mów użytkownikowi",
+    "nie mow uzytkownikowi",
+    "nie informuj użytkownika",
+    "ukryj to przed użytkownikiem"
+  ]
+}
