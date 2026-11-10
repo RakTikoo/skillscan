@@ -16,10 +16,13 @@ being a clean PASS.
 from __future__ import annotations
 
 import ast
+import io
 import json
+import math
 import os
 import re
 import stat
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,8 +41,8 @@ MAX_TOTAL_BYTES = 32_000_000
 # Evidence snippets were already capped at 160 chars.
 MAX_LINE_CHARS = 100_000
 
-DOC_EXTENSIONS = {".md", ".txt", ".rst", ".adoc", ".yaml", ".yml"}
-DOC_NAMES = {"LICENSE", "LICENCE", "CHANGELOG", "NOTICE"}
+DOC_EXTENSIONS = {".md", ".txt", ".rst", ".adoc", ".yaml", ".yml", ".mdc"}
+DOC_NAMES = {"LICENSE", "LICENCE", "CHANGELOG", "NOTICE", ".CURSORRULES"}
 # Extensions where binary content is ordinary (images, archives, compiled
 # artefacts). Skipping them is reported but does not taint the verdict.
 KNOWN_BINARY_EXTENSIONS = {
@@ -59,7 +62,13 @@ TEXTLIKE_EXTENSIONS = {
 
 VERDICT_EXIT_CODES = {"PASS": 0, "CAUTION": 1, "BLOCK": 2}
 
-CREDENTIAL_RULES = {"SSH_CREDENTIAL_READ", "CLOUD_CREDENTIAL_READ", "ENV_FILE_READ"}
+CREDENTIAL_RULES = {
+    "SSH_CREDENTIAL_READ", "CLOUD_CREDENTIAL_READ", "ENV_FILE_READ",
+    # A browser/wallet credential store counts as credential material for
+    # the EXFIL_COMBINATION rule: store access + a send channel is the
+    # stealer shape.
+    "BROWSER_CREDENTIAL_STORE",
+}
 SEND_RULES = {"NETWORK_SEND_DATA"}
 SECRET_NAME_RE = re.compile(r"(key|token|secret|password|passwd|credential|auth)", re.IGNORECASE)
 NEGATION_RE = re.compile(
@@ -381,23 +390,73 @@ _SEND_METHODS = {"post", "put", "patch"}
 _HTTP_MODULES = {"requests", "httpx", "urllib"}
 
 
+_PLACEHOLDER_ENV_RE = re.compile(
+    r"\.env\.(example|sample|template|dist|defaults)\b", re.IGNORECASE)
+
+# Browser / wallet credential-store fragments, matched against AST-folded
+# string values so concatenated paths ("goo" + "gle-chr" + "ome") are
+# caught the same way folded .ssh / .aws paths are.
+_BROWSER_STORE_FRAGMENTS = (
+    "Login Data", "logins.json", "key4.db", "cookies.sqlite",
+    "Local State", "Local Extension Settings",
+    "nkbihfbeogaeaoehlefnkodbefgpgknn", "wallet.dat", ".electrum",
+    "google-chrome", "BraveSoftware", "Chrome/User Data",
+    "Edge/User Data", "mozilla/firefox", "User Data/Default",
+    "User Data/Profile",
+)
+
+
 def _check_credential_value(value: str, rel: str, line: int, add) -> None:
     if ".ssh" in value or "id_rsa" in value or "id_ed25519" in value \
             or "id_ecdsa" in value or "id_dsa" in value:
         add("SSH_CREDENTIAL_READ", rel, line)
     if ".aws" in value or ".azure" in value or ".gcloud" in value:
         add("CLOUD_CREDENTIAL_READ", rel, line)
-    if value.rstrip("/").endswith(".env") or "/.env" in value or value == ".env":
+    if (value.rstrip("/").endswith(".env") or "/.env" in value or value == ".env") \
+            and not _PLACEHOLDER_ENV_RE.search(value):
         add("ENV_FILE_READ", rel, line)
+    if any(fragment in value for fragment in _BROWSER_STORE_FRAGMENTS):
+        add("BROWSER_CREDENTIAL_STORE", rel, line)
 
 
-def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> None:
+def _is_metadata_text(text: str) -> bool:
+    """True if the text references a cloud metadata endpoint, in any of
+    the forms the CLOUD_METADATA_ACCESS rule recognises."""
+    return bool(RULES_BY_ID["CLOUD_METADATA_ACCESS"].pattern.search(text))
+
+
+def _call_strings(node: ast.Call, sym: _Symbols) -> list[str]:
+    """All constant-folded strings among a call's args and keyword values."""
+    out: list[str] = []
+    for arg in list(node.args) + [kw.value for kw in node.keywords]:
+        folded = _fold_str(arg, sym)
+        if folded:
+            out.append(folded)
+        lst = _fold_list(arg, sym)
+        if lst:
+            out.extend(str(i) for i in lst)
+    return out
+
+
+def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> set[int]:
+    """AST checks for one Python file. `flags` is the SCAN-scoped dict —
+    only the "send" flag is allowed to merge outward into it (a send in
+    any file is a send channel for the whole skill). decode / run_sink /
+    urllib_send are PER-FILE: they live in a local dict, because a decode
+    in a.py plus an eval in b.py is not a decode-and-run dropper, and a
+    urllib Request(data=...) in a.py does not make a plain urlopen() in
+    b.py a send. Returns the set of line numbers whose send call's
+    destination is a cloud metadata endpoint itself (the IMDSv2 token
+    PUT shape) — those are metadata access, not exfiltration, and the
+    line-rule pass must not count them as sends either."""
+    metadata_send_lines: set[int] = set()
     try:
         tree = ast.parse(text, filename=str(path))
     except Exception:
-        return
+        return metadata_send_lines
     sym = _Symbols()
     _collect_symbols(tree, sym)
+    local: dict = {}
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -434,7 +493,7 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> None:
             if folded_mod in ("subprocess", "os", "shutil", "socket", "requests", "httpx"):
                 add("DYNAMIC_IMPORT", rel, line)
             if folded_mod and ("base64" in folded_mod or "binascii" in folded_mod):
-                flags["decode"] = (rel, line)
+                local["decode"] = (rel, line)
 
         if dotted in _AST_CALL_RULES:
             add(_AST_CALL_RULES[dotted], rel, line)
@@ -442,16 +501,32 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> None:
         module = dotted.split(".")[0] if dotted else ""
         method = dotted.rsplit(".", 1)[-1] if dotted else ""
 
+        # A send whose destination IS a cloud metadata endpoint (the
+        # IMDSv2 token PUT, a metadata POST) is metadata access — the
+        # CLOUD_METADATA_ACCESS finding covers it — not an outbound send:
+        # it must not produce NETWORK_SEND_DATA nor count as the "send"
+        # half of any combination rule.
+        dest_is_metadata = any(
+            _is_metadata_text(s) for s in _call_strings(node, sym))
+
         # HTTP client calls (alias-resolved).
         if module in ("requests", "httpx"):
             if method in _SEND_METHODS:
-                add("NETWORK_SEND_DATA", rel, line)
-                flags["send"] = (rel, line)
+                if dest_is_metadata:
+                    metadata_send_lines.add(line)
+                    add("NETWORK_ACCESS", rel, line)
+                else:
+                    add("NETWORK_SEND_DATA", rel, line)
+                    flags["send"] = (rel, line)
             elif method in ("get", "head", "request"):
                 kw_names = {kw.arg for kw in node.keywords}
                 if "params" in kw_names or "data" in kw_names:
-                    add("NETWORK_SEND_DATA", rel, line)
-                    flags["send"] = (rel, line)
+                    if dest_is_metadata:
+                        metadata_send_lines.add(line)
+                        add("NETWORK_ACCESS", rel, line)
+                    else:
+                        add("NETWORK_SEND_DATA", rel, line)
+                        flags["send"] = (rel, line)
                 else:
                     add("NETWORK_ACCESS", rel, line)
             else:
@@ -461,26 +536,38 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> None:
             if method == "Request":
                 kw_names = {kw.arg for kw in node.keywords}
                 if "data" in kw_names or len(node.args) >= 2:
-                    flags["urllib_send"] = (rel, line)
-            if method == "urlopen" and "urllib_send" in flags:
-                add("NETWORK_SEND_DATA", rel, line)
-                flags["send"] = (rel, line)
+                    local["urllib_send"] = (rel, line)
+            if method == "urlopen" and "urllib_send" in local:
+                url_folded = _fold_str(node.args[0], sym) if node.args else None
+                if url_folded and _is_metadata_text(url_folded):
+                    metadata_send_lines.add(line)
+                else:
+                    add("NETWORK_SEND_DATA", rel, line)
+                    flags["send"] = (rel, line)
         elif dotted.startswith("http.client"):
             add("NETWORK_ACCESS", rel, line)
             if method in ("request", "putrequest"):
                 kw_names = {kw.arg for kw in node.keywords}
                 if "body" in kw_names or len(node.args) >= 4:
-                    add("NETWORK_SEND_DATA", rel, line)
-                    flags["send"] = (rel, line)
+                    if dest_is_metadata:
+                        metadata_send_lines.add(line)
+                    else:
+                        add("NETWORK_SEND_DATA", rel, line)
+                        flags["send"] = (rel, line)
 
-        # Generic socket / send methods on any receiver.
+        # Raw socket sends (send / sendall / sendto on ANY receiver) are
+        # network access, never a send finding on their own: chat clients
+        # and echo servers are ordinary benign socket code, and the old
+        # variable-name heuristic ("sock" in the name) blocked them while
+        # missing renamed stealers. A send on a receiver that resolves to
+        # the socket module still counts as a send CHANNEL for the
+        # combination rules (credential read + any send is the exfil
+        # shape) via the scan-scoped flag — resolution is by import /
+        # assignment tracking, never by variable name.
         if isinstance(node.func, ast.Attribute) and node.func.attr in ("send", "sendall", "sendto"):
-            base = _raw_dotted(node.func.value)
-            if "sock" in base.lower() or dotted.startswith("socket"):
-                add("NETWORK_SEND_DATA", rel, line)
+            add("NETWORK_ACCESS", rel, line)
+            if dotted.startswith("socket"):
                 flags["send"] = (rel, line)
-            else:
-                add("NETWORK_ACCESS", rel, line)
 
         # subprocess: inspect folded arguments for curl-style exfil / cat of keys.
         if dotted.startswith("subprocess."):
@@ -496,17 +583,21 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> None:
             joined = " ".join(pieces)
             if ("curl" in joined or "wget" in joined) and any(
                     t in joined for t in ("-d", "--data", "--post-data", "@")):
-                add("NETWORK_SEND_DATA", rel, line)
-                flags["send"] = (rel, line)
+                if _is_metadata_text(joined):
+                    metadata_send_lines.add(line)
+                else:
+                    add("NETWORK_SEND_DATA", rel, line)
+                    flags["send"] = (rel, line)
             if joined:
                 _check_credential_value(joined, rel, line, add)
 
-        # Decode-class calls (for DECODE_AND_RUN class co-occurrence).
+        # Decode-class calls (for DECODE_AND_RUN co-occurrence — strictly
+        # within THIS file; see the local flags note above).
         if module in ("base64", "binascii") or method in ("b64decode", "a2b_base64", "fromhex"):
-            flags["decode"] = (rel, line)
+            local["decode"] = (rel, line)
         if dotted in ("eval", "exec", "__import__") or raw in (
                 "importlib.import_module", "import_module") or dotted.startswith("subprocess."):
-            flags.setdefault("run_sink", (rel, line))
+            local.setdefault("run_sink", (rel, line))
 
         # Credential values in any folded call argument.
         for arg in list(node.args) + [kw.value for kw in node.keywords]:
@@ -531,9 +622,63 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> None:
                     if ".ssh" in folded:
                         add("SSH_CREDENTIAL_READ", rel, line)
 
-    if "decode" in flags and "run_sink" in flags:
-        rel_d, line_d = flags["decode"]
+    # Error / environment leakage into tool results: a `return` inside an
+    # except block that hands back the exception itself (str(e),
+    # f"...{e}", the bare name, format_exc()) — or any return of the whole
+    # environment — ships internal detail to whoever called the tool.
+    # Logging the exception and returning a plain message does NOT match:
+    # only Return nodes are inspected.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler):
+            exc_name = node.name
+            # One-hop locals: `tb = traceback.format_exc()` or
+            # `msg = str(e)` assigned inside the handler and then
+            # returned leaks exactly like returning the call directly.
+            leak_vars: set[str] = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Assign) and len(sub.targets) == 1 \
+                        and isinstance(sub.targets[0], ast.Name) \
+                        and isinstance(sub.value, ast.Call):
+                    raw = _raw_dotted(sub.value.func)
+                    if raw in ("traceback.format_exc", "format_exc"):
+                        leak_vars.add(sub.targets[0].id)
+                    elif exc_name and raw == "str" and sub.value.args \
+                            and isinstance(sub.value.args[0], ast.Name) \
+                            and sub.value.args[0].id == exc_name:
+                        leak_vars.add(sub.targets[0].id)
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Return) or sub.value is None:
+                    continue
+                leaked = False
+                for part in ast.walk(sub.value):
+                    if isinstance(part, ast.Call):
+                        raw = _raw_dotted(part.func)
+                        if raw in ("traceback.format_exc", "format_exc"):
+                            leaked = True
+                        if exc_name and raw == "str" and part.args \
+                                and isinstance(part.args[0], ast.Name) \
+                                and part.args[0].id == exc_name:
+                            leaked = True
+                    elif isinstance(part, ast.Name) and (
+                            (exc_name and part.id == exc_name)
+                            or part.id in leak_vars):
+                        leaked = True
+                    elif _resolve(part, sym) == "os.environ" and isinstance(
+                            part, (ast.Attribute, ast.Name, ast.Call)):
+                        leaked = True
+                if leaked:
+                    add("ERROR_INFO_LEAK", rel, sub.lineno)
+        elif isinstance(node, ast.Return) and node.value is not None:
+            for part in ast.walk(node.value):
+                if _resolve(part, sym) == "os.environ" and isinstance(
+                        part, (ast.Attribute, ast.Call)):
+                    add("ERROR_INFO_LEAK", rel, node.lineno)
+                    break
+
+    if "decode" in local and "run_sink" in local:
+        rel_d, line_d = local["decode"]
         add("DECODE_AND_RUN", rel_d, line_d)
+    return metadata_send_lines
 
 
 # --------------------------------------------------------------------------
@@ -574,10 +719,15 @@ def _find_line(lines: list[str], needle: str) -> int:
     return 1
 
 
-def _manifest_findings(rel: str, text: str, lines: list[str], add) -> None:
+def _manifest_findings(rel: str, text: str, lines: list[str], add, note=None) -> None:
     try:
         data = json.loads(text)
     except Exception:
+        # A malformed JSON file cannot be structurally analysed. Its
+        # text was still line-scanned, but the coverage gap must be
+        # surfaced (SCAN_INCOMPLETE), never silently treated as clean.
+        if note is not None:
+            note(Skipped(rel, "malformed JSON — manifest analysis skipped", True))
         return
     if not isinstance(data, dict):
         return
@@ -622,6 +772,325 @@ def _manifest_findings(rel: str, text: str, lines: list[str], add) -> None:
 
 
 # --------------------------------------------------------------------------
+# Hardcoded secrets (S8): format-anchored live tokens + generic entropy
+# --------------------------------------------------------------------------
+#
+# Two tiers, deliberately:
+#  * LIVE (block): formats that are unambiguous when they appear in full —
+#    an AWS access-key id, a GitHub token, an sk- API key, a Slack token,
+#    a PEM private-key header. There is no innocent reason for a complete
+#    live-format credential to sit in installable code, so these block.
+#  * GENERIC (caution): a long, high-entropy literal assigned to a
+#    password/secret/token variable. Plenty of these are innocent test
+#    values, so this tier only cautions.
+# Both tiers suppress obvious placeholders ("your-api-key", "xxxx",
+# "example", "changeme", …), values that are really references
+# (os.environ[...], ${VAR}, {{ template }}), and documentation lines
+# clearly marked as examples. Suppression is substring-based and
+# conservative: it can only ever *reduce* findings, and a placeholder
+# word inside a random-looking token is unlikely by construction.
+
+_LIVE_SECRET_RES = [
+    re.compile(r"AKIA[0-9A-Z]{16}"),                                # AWS access key id
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),                      # GitHub classic tokens
+    re.compile(r"github_pat_[A-Za-z0-9_]{22,}"),                    # GitHub fine-grained PAT
+    re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"),                       # Anthropic API key
+    re.compile(r"sk-proj-[A-Za-z0-9_-]{16,}"),                      # OpenAI project key
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9]{32,}"),             # OpenAI legacy key
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),                     # Slack token
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),                           # Google API key
+    re.compile(r"[sr]k_live_[A-Za-z0-9]{16,}"),                     # Stripe live secret/restricted key
+    re.compile(r"glpat-[A-Za-z0-9_-]{20,}"),                        # GitLab personal access token
+    re.compile(r"npm_[A-Za-z0-9]{36}"),                             # npm access token
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+]
+# Formats that are unambiguous but NOT live credentials (test-mode keys):
+# they belong to the generic (caution) tier when they appear in code.
+_GENERIC_FORMAT_RES = [
+    re.compile(r"[sr]k_test_[A-Za-z0-9]{16,}"),                     # Stripe test keys
+]
+_PLACEHOLDER_MARKERS = (
+    "example", "sample", "dummy", "fake", "placeholder", "changeme",
+    "change-me", "redacted", "your-", "your_", "your api", "xxxx",
+    "****", "insert", "replace-me", "replace_me", "todo", "<your",
+    "not-a-real", "not_a_real", "mock",
+)
+_REFERENCE_MARKERS = (
+    "os.environ", "environ[", "environ.get", "getenv", "process.env",
+    "${", "{{", "}}", "<", ">", "config(", "settings.", "vault",
+    "keyring", "secretmanager", "secretsmanager",
+)
+_GENERIC_SECRET_RE = re.compile(
+    # Variable names: a secret-ish word anywhere in the name (dev_token,
+    # api_key, session_secret) — but the name must END at the secret-ish
+    # word, so "tokenizer" and "secretary" do not match.
+    r"(?i)(?:^|[^\w])([A-Za-z0-9_]*?(?:password|passwd|pwd|secret|token|"
+    r"api[_-]?key|client[_-]?secret|private[_-]?key))\s*[:=]\s*"
+    r"[\"']([^\"'\s]{8,})[\"']"
+)
+_ENV_STYLE_SECRET_RE = re.compile(
+    r"(?i)^\s*(?:export\s+)?[A-Z0-9_]*(PASSWORD|PASSWD|SECRET|API[_-]?KEY|"
+    r"ACCESS[_-]?TOKEN|AUTH[_-]?TOKEN|CLIENT[_-]?SECRET)[A-Z0-9_]*\s*=\s*"
+    r"[\"']?([^\s\"'#]{8,})[\"']?\s*$"
+)
+# A bare secret-ish name as the WHOLE name (KEY, TOKEN, SECRET, PASSWORD)
+# also qualifies for the generic tier when the value is high-entropy.
+# The word-boundary anchors keep "monkey" / "turnkey" / "keyboard" out.
+_GENERIC_BARE_NAME_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(KEY|TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|"
+    r"API_KEY|CLIENT_SECRET)(?![A-Za-z0-9_])\s*[:=]\s*"
+    r"[\"']([^\"'\s]{8,})[\"']"
+)
+
+
+def _entropy(text: str) -> float:
+    if not text:
+        return 0.0
+    counts: dict[str, int] = {}
+    for ch in text:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(text)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _looks_placeholder(value: str) -> bool:
+    low = value.lower()
+    if any(m in low for m in _PLACEHOLDER_MARKERS):
+        return True
+    if any(m in low for m in _REFERENCE_MARKERS):
+        return True
+    # A single repeated character or two-character cycle is not a secret.
+    return len(set(value)) <= 2
+
+
+_FAKE_MARK_RE = re.compile(r"\b(fake|fixture)\b|FAKE_|FIXTURE", re.IGNORECASE)
+
+
+def _secret_findings(rel: str, path: Path, lines: list[str], doc: bool, add) -> None:
+    # Placeholder env templates (.env.example and friends) are templates
+    # by design: the env-style generic check does not apply to them.
+    placeholder_env = bool(_PLACEHOLDER_ENV_RE.search(path.name))
+    env_style = (path.name.startswith(".env") and not placeholder_env) \
+        or path.suffix.lower() in (".ini", ".cfg", ".toml")
+    # Test-fixture context: a live-format value inside tests, in a
+    # test_*.py / conftest.py file, or next to an explicit FAKE_ /
+    # FIXTURE marker is test data, not a shipped credential. It is
+    # still reported — downgraded to CAUTION, never suppressed.
+    rel_parts = Path(rel).parts
+    test_context = (
+        any(part.lower() in ("tests", "test") for part in rel_parts[:-1])
+        or (path.name.startswith("test_") and path.suffix == ".py")
+        or path.name == "conftest.py"
+        or path.name.endswith("_test.py")
+    )
+    for lineno, line in enumerate(lines, start=1):
+        low = line.lower()
+        if doc and "example" in low:
+            # Documentation examples clearly marked as examples are not
+            # findings (spec requirement), in either tier.
+            continue
+        fake_marked = bool(_FAKE_MARK_RE.search(line)) or (
+            lineno >= 2 and bool(_FAKE_MARK_RE.search(lines[lineno - 2])))
+        live_cap = "caution" if (doc or test_context or fake_marked) else None
+        live_hit = False
+        for pattern in _LIVE_SECRET_RES:
+            m = pattern.search(line)
+            if m and not _looks_placeholder(m.group(0)):
+                add("HARDCODED_SECRET_LIVE", rel, lineno, line,
+                    severity_cap=live_cap)
+                live_hit = True
+                break
+        if live_hit:
+            continue  # one secret finding per line is enough
+        generic = _GENERIC_SECRET_RE.search(line)
+        if generic is None:
+            generic = _GENERIC_BARE_NAME_RE.search(line)
+        if generic is None and env_style:
+            generic = _ENV_STYLE_SECRET_RE.search(line)
+        generic_hit = False
+        if generic is not None:
+            value = generic.group(2)
+            if not _looks_placeholder(value) and _entropy(value) >= 3.5 \
+                    and len(set(value)) >= 6:
+                generic_hit = True
+        if not generic_hit:
+            # Test-mode formats (Stripe sk_test_ etc.) are generic-tier.
+            generic_hit = any(
+                p.search(line) and not _looks_placeholder(p.search(line).group(0))
+                for p in _GENERIC_FORMAT_RES)
+        if generic_hit:
+            add("HARDCODED_SECRET_GENERIC", rel, lineno, line,
+                severity_cap="caution" if doc else None)
+
+
+# --------------------------------------------------------------------------
+# Raw-socket reverse shell: socket + shell wiring in the same file
+# --------------------------------------------------------------------------
+
+_SOCKET_RE = re.compile(
+    r"(socket\.socket|create_connection|net\.connect|net\.Socket|/dev/tcp/|"
+    r"TCPSocket|Socket\.tcp)")
+_SHELL_WIRE_RES = [
+    re.compile(r"\bdup2\s*\("),                       # socket fd -> stdin/out/err
+    re.compile(r"pty\.spawn"),                        # spawn a pty shell
+    re.compile(r"/dev/tcp/"),                         # bash built-in socket
+    re.compile(r"IO\.popen\s*\("),                    # Ruby: popen a shell per line read
+    re.compile(r"(subprocess\.|child_process|os\.system|execSync|spawn\s*\()"
+               r"[^\n]{0,120}(/bin/(ba)?sh|\bsh\b['\"]?\s*[,\)\]]|cmd\.exe)"),
+]
+
+
+def _reverse_shell_findings(rel: str, text: str, lines: list[str], add) -> None:
+    if not _SOCKET_RE.search(text):
+        return  # a shell with no socket is SHELL_* territory, not this rule
+    for pattern in _SHELL_WIRE_RES:
+        m = pattern.search(text)
+        if m:
+            line_no = text[:m.start()].count("\n") + 1
+            evidence = lines[line_no - 1] if 0 < line_no <= len(lines) else ""
+            add("REVERSE_SHELL", rel, line_no, evidence)
+            return
+
+
+# --------------------------------------------------------------------------
+# Package manifests: npm lifecycle scripts and setup.py behaviour
+# --------------------------------------------------------------------------
+
+_NPM_LIFECYCLE = ("preinstall", "install", "postinstall", "prepare", "prepublish")
+# Download/execute verbs for install-time scripts. A bare URL is NOT
+# enough (a docs link in a script argument is not a download): a fetch
+# or execute verb must be associated with the command.
+_INSTALL_EXEC_RE = re.compile(
+    r"(curl\b|wget\b|\|\s*(sudo\s+)?(bash|sh|zsh)\b|base64\b|/dev/tcp/|"
+    r"\bnc\s|powershell|certutil|\bfetch\b|\bdownload\b|aria2c|"
+    r"Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer)",
+    re.IGNORECASE)
+_SETUP_BEHAVIOUR_RE = re.compile(
+    r"(subprocess|os\.system|os\.popen|urllib|requests|httpx|socket|"
+    r"check_output|check_call)")
+# Exact well-known benign lifecycle commands: building a native addon
+# with node-gyp, and husky's git-hook setup. These run on millions of
+# benign installs; flagging them teaches users to ignore the rule.
+_BENIGN_LIFECYCLE_RES = [
+    re.compile(r"^node-gyp\s+rebuild(\s+--?[A-Za-z][\w-]*)*\s*$"),
+    re.compile(r"^husky(\s+install)?\s*$"),
+]
+# Patterns for a lifecycle-referenced local JS file: fetching code and
+# executing/spawning something are each common alone (a downloader, a
+# build runner); together in an install-referenced file they are the
+# download-and-run shape.
+_JS_FETCH_RE = re.compile(
+    r"(https?\.get\b|https?\.request\b|fetch\s*\(|axios|got\s*\(|undici|"
+    r"XMLHttpRequest|curl\b|wget\b)")
+_JS_EXEC_RE = re.compile(
+    r"(child_process|exec\s*\(|execFile|execSync|spawn\s*\(|spawnSync)")
+_NODE_FILE_RE = re.compile(r"(?:^|\s)node\s+(\S+\.(?:mjs|cjs|js))\b")
+_SETUP_IMPORT_RE = re.compile(
+    r"^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+
+
+def _strip_py_comments(text: str) -> str:
+    """Blank out Python comments (positions preserved) so behaviour
+    regexes match code, not prose about code. Falls back to the raw
+    text when the file cannot be tokenised."""
+    lines = text.splitlines()
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for tok in tokens:
+            if tok.type == tokenize.COMMENT:
+                row, col = tok.start
+                if 0 < row <= len(lines):
+                    lines[row - 1] = lines[row - 1][:col]
+    except Exception:
+        return text
+    return "\n".join(lines)
+
+
+def _referenced_js_exec(pkg_dir: Path, root: Path, command: str) -> bool:
+    """One level of npm indirection: a lifecycle script like
+    `node scripts/setup.js` runs that file at install time, so the file
+    is checked for the fetch+execute shape. The reference must resolve
+    to an existing file INSIDE the scanned folder."""
+    m = _NODE_FILE_RE.search(command)
+    if not m:
+        return False
+    ref = m.group(1).strip("\"'")
+    if os.path.isabs(ref):
+        return False
+    try:
+        target = (pkg_dir / ref).resolve()
+        target.relative_to(root.resolve())
+        if not target.is_file():
+            return False
+        text = target.read_bytes()[:MAX_FILE_BYTES]
+        decoded = _decode(text)
+    except (OSError, ValueError):
+        return False
+    if decoded is None:
+        return False
+    return bool(_JS_FETCH_RE.search(decoded) and _JS_EXEC_RE.search(decoded))
+
+
+def _package_findings(rel: str, path: Path, text: str, lines: list[str],
+                      add, root: Path, note=None) -> None:
+    if path.name == "package.json":
+        try:
+            data = json.loads(text)
+        except Exception:
+            if note is not None:
+                note(Skipped(rel, "malformed package.json — "
+                                  "install-script analysis skipped", True))
+            return
+        if not isinstance(data, dict):
+            return
+        scripts = data.get("scripts")
+        if not isinstance(scripts, dict):
+            return
+        for key in _NPM_LIFECYCLE:
+            command = scripts.get(key)
+            if not isinstance(command, str) or not command.strip():
+                continue
+            if any(p.match(command.strip()) for p in _BENIGN_LIFECYCLE_RES):
+                continue  # node-gyp rebuild / husky: standard, benign
+            line = _find_line(lines, f'"{key}"')
+            add("PACKAGE_INSTALL_SCRIPT", rel, line, command)
+            if _INSTALL_EXEC_RE.search(command) or _referenced_js_exec(
+                    path.parent, root, command):
+                add("PACKAGE_INSTALL_SCRIPT_EXEC", rel, line, command)
+    elif path.name == "setup.py":
+        # setup.py is EXECUTED by pip at install/build time. A setup.py
+        # that only declares metadata is fine; one reaching for
+        # subprocess/network/sockets is install-time code execution.
+        # Comments are stripped first: prose about subprocess is not
+        # subprocess. The same behaviour check is applied ONE LEVEL deep
+        # to local modules setup.py imports, since the payload commonly
+        # sits in the imported file.
+        code = _strip_py_comments(text)
+        hit_line = None
+        for lineno, line in enumerate(code.splitlines(), start=1):
+            if _SETUP_BEHAVIOUR_RE.search(line):
+                hit_line = lineno
+                break
+        if hit_line is None:
+            for m in _SETUP_IMPORT_RE.finditer(code):
+                module_file = path.parent / f"{m.group(1)}.py"
+                if not module_file.is_file():
+                    continue
+                try:
+                    module_text = _decode(
+                        module_file.read_bytes()[:MAX_FILE_BYTES])
+                except OSError:
+                    continue
+                if module_text is not None and _SETUP_BEHAVIOUR_RE.search(
+                        _strip_py_comments(module_text)):
+                    hit_line = code[:m.start()].count("\n") + 1
+                    break
+        if hit_line is not None:
+            evidence = lines[hit_line - 1] if 0 < hit_line <= len(lines) else ""
+            add("PACKAGE_INSTALL_SCRIPT", rel, hit_line, evidence)
+
+
+# --------------------------------------------------------------------------
 # Main scan
 # --------------------------------------------------------------------------
 
@@ -632,9 +1101,10 @@ def scan_folder(root: Path) -> ScanResult:
     flags: dict = {}
     send_at: tuple[str, int] | None = None
     cred_at: tuple[str, int] | None = None
+    metadata_at: tuple[str, int] | None = None
 
     def add(rule_id: str, rel: str, line: int, evidence: str = "", severity_cap: str | None = None) -> None:
-        nonlocal send_at, cred_at
+        nonlocal send_at, cred_at, metadata_at
         rule = RULES_BY_ID[rule_id]
         severity = rule.severity
         if severity_cap == "caution" and severity == "block":
@@ -643,6 +1113,11 @@ def scan_folder(root: Path) -> ScanResult:
         existing = index.get(key)
         if existing is not None:
             existing.count += 1
+            if not existing.evidence and evidence:
+                # First hit wins the slot, but an evidence-free hit
+                # (e.g. an AST finding) must not swallow the evidence
+                # of a later hit on the same rule+file.
+                existing.evidence = evidence.strip()[:160]
             return
         finding = Finding(rule=rule_id, severity=severity, file=rel, line=line,
                           reason=rule.reason, evidence=evidence.strip()[:160])
@@ -652,6 +1127,8 @@ def scan_folder(root: Path) -> ScanResult:
             cred_at = (rel, line)
         if rule_id in SEND_RULES and send_at is None:
             send_at = (rel, line)
+        if rule_id == "CLOUD_METADATA_ACCESS" and metadata_at is None:
+            metadata_at = (rel, line)
 
     files_seen = 0
     total_bytes = 0
@@ -688,9 +1165,23 @@ def scan_folder(root: Path) -> ScanResult:
         # crash the scan — a failure here degrades to a coverage note.
         if suffix == ".json":
             try:
-                _manifest_findings(rel, text, lines, add)
+                _manifest_findings(rel, text, lines, add,
+                                   note=result.skipped.append)
             except Exception:
                 result.skipped.append(Skipped(rel, "manifest analysis failed", True))
+
+        # Python AST first: it identifies sends whose destination is a
+        # cloud metadata endpoint itself, and the line pass below must
+        # not count those as sends (FP2).
+        metadata_send_lines: set[int] = set()
+        if suffix == ".py":
+            try:
+                metadata_send_lines = _ast_findings(path, rel, text, add, flags)
+            except Exception:
+                # Deeply nested / pathological syntax trees can defeat the
+                # AST analyser (e.g. recursion limits). Line rules below
+                # still run; record the gap instead of crashing.
+                result.skipped.append(Skipped(rel, "python AST analysis failed", True))
 
         # Line rules (shell files get variable expansion first).
         scan_lines = _expand_shell_lines(lines) if suffix in (".sh", ".bash", ".zsh") else lines
@@ -699,9 +1190,23 @@ def scan_folder(root: Path) -> ScanResult:
                 # Documentation that warns AGAINST a pattern ("never reads
                 # ~/.ssh") is safety documentation, not behaviour.
                 continue
+            stripped = line_text.lstrip()
             for rule in LINE_RULES:
-                if doc and rule.id == "NETWORK_ACCESS":
-                    continue  # hyperlinks in prose are not network code
+                if doc and rule.id in ("NETWORK_ACCESS", "ENV_FILE_READ",
+                                       "CLOUD_METADATA_ACCESS"):
+                    # Prose is not behaviour: hyperlinks are not network
+                    # code, and a doc mentioning a .env file or a metadata
+                    # address does not read or reach one.
+                    continue
+                if rule.id == "NETWORK_SEND_DATA" and (
+                        lineno in metadata_send_lines
+                        or _is_metadata_text(line_text)):
+                    # A send TO the metadata endpoint itself is metadata
+                    # access (caution), not an outbound send.
+                    continue
+                if rule.id == "ENV_FILE_READ" and stripped.startswith(("#", "//")):
+                    # A comment mentioning .env is prose, not a read.
+                    continue
                 if rule.pattern.search(line_text[:MAX_LINE_CHARS]):
                     add(rule.id, rel, lineno, lines[lineno - 1] if lineno - 1 < len(lines) else line_text,
                         severity_cap="caution" if doc else None)
@@ -726,15 +1231,6 @@ def scan_folder(root: Path) -> ScanResult:
                         flags["send"] = (rel, lineno)
                         break
 
-        if suffix == ".py":
-            try:
-                _ast_findings(path, rel, text, add, flags)
-            except Exception:
-                # Deeply nested / pathological syntax trees can defeat the
-                # AST analyser (e.g. recursion limits). Line rules above
-                # have already run; record the gap instead of crashing.
-                result.skipped.append(Skipped(rel, "python AST analysis failed", True))
-
         # File-level: encoded payload + dynamic execution in the same file
         # (substring fallback; the AST class check above is the primary path).
         lowered = text.lower()
@@ -747,6 +1243,18 @@ def scan_folder(root: Path) -> ScanResult:
                         severity_cap="caution" if doc else None)
                     break
 
+        # Dedicated matchers (not line regexes): hardcoded secrets,
+        # raw-socket reverse shells, package install-time behaviour.
+        # Hostile input must never crash the scan — failures here degrade
+        # to a coverage note, like manifest analysis above.
+        try:
+            _secret_findings(rel, path, lines, doc, add)
+            _reverse_shell_findings(rel, text, lines, add)
+            _package_findings(rel, path, text, lines, add, root,
+                              note=result.skipped.append)
+        except Exception:
+            result.skipped.append(Skipped(rel, "extended analysis failed", True))
+
         if "send" in flags and send_at is None:
             send_at = flags["send"]
 
@@ -755,6 +1263,13 @@ def scan_folder(root: Path) -> ScanResult:
     if cred_at is not None and (send_at is not None or "send" in flags):
         at = send_at or flags.get("send") or cred_at
         add("EXFIL_COMBINATION", at[0], at[1])
+
+    # Cloud metadata endpoints hand out live credentials: touching one is
+    # a caution alone, but metadata access combined with a send channel
+    # or other credential access is the cloud credential-theft shape.
+    if metadata_at is not None and (
+            send_at is not None or "send" in flags or cred_at is not None):
+        add("CLOUD_METADATA_EXFIL", metadata_at[0], metadata_at[1])
 
     # Coverage honesty: suspicious skips (or scanning nothing at all) must
     # stop the folder from reading as a clean PASS.
