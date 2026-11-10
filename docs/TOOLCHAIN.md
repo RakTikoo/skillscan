@@ -47,7 +47,7 @@ separate report.
 
 ## 3. Pre-install hook
 
-`hooks/pre-install-scan.sh` wraps the scanner for install-time use:
+`hooks/pre-install-scan.sh` wraps the scanner for install-time use. (If your copy is not executable — some download methods drop the executable bit — run `chmod +x hooks/pre-install-scan.sh` once, or invoke it as `bash hooks/pre-install-scan.sh <folder>`.)
 
 ```bash
 ./hooks/pre-install-scan.sh ./downloaded-skill   # prints the report
