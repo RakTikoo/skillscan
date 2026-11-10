@@ -128,8 +128,11 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full guide:
 
 ## Rules
 
-34 deterministic rules. Any block-severity hit makes the verdict BLOCK;
-otherwise any caution hit makes it CAUTION; otherwise PASS.
+41 deterministic rules. Any block-severity hit makes the verdict BLOCK;
+otherwise any caution hit makes it CAUTION; otherwise PASS. Every rule
+also carries an OWASP mapping (LLM Top 10 / MCP Top 10 category codes),
+surfaced per finding in JSON output and in SARIF rule metadata — it is
+triage metadata only and never affects the verdict.
 
 | Rule | Severity | What it catches |
 |------|----------|-----------------|
@@ -166,7 +169,14 @@ otherwise any caution hit makes it CAUTION; otherwise PASS.
 | ERROR_INFO_LEAK | caution | Returns raw exception text, a stack trace, or an environment dump as a tool result (logging the error and returning a plain message is not flagged) |
 | PACKAGE_INSTALL_SCRIPT | caution | Package runs code at install time: an npm lifecycle script (`preinstall`/`install`/`postinstall`/`prepare`) or a `setup.py` that reaches for subprocess/network/sockets |
 | PACKAGE_INSTALL_SCRIPT_EXEC | block | An install-time script downloads or executes outside code (curl/wget, pipe-to-shell, encoded payload, remote fetch) |
-| SCAN_INCOMPLETE | caution | Some content could not be scanned, or nothing was scanned — the verdict is partial |
+| HIDDEN_TEXT | block / caution | Concealed text: zero-width or bidirectional control characters, Unicode Tags-block payloads (BLOCK when the decoded payload contains instruction keywords), or HTML comments carrying instruction-like content. A single zero-width joiner in ordinary multilingual text does not fire |
+| NON_ENGLISH_INSTRUCTION | caution | Instruction-attack phrases in 14 other languages (override / send-the-credentials / keep-it-from-the-user shapes) — a phrase list, not language understanding. The lists are data files (`skillscan/phrases/<code>.json`): adding a language = adding one file |
+| ANY_LANGUAGE_STRUCTURE | caution | An instruction surface in ANY language pairs a private credential store (`~/.ssh`, `~/.aws`, a `.env` file, a browser credential store) with an outbound destination (URL, IP, email, curl/wget, webhook). Normal integration guides (your own token → the service's API URL) and safety warnings do not fire |
+| MARKDOWN_CONCEALMENT | caution | Content hidden from a rendered view (display:none, visibility:hidden, white-on-white, off-screen positioning, hidden attribute) that contains instruction-grade wording. A plain `<details>` disclosure block does not fire on its own |
+| SUBSTITUTION_EXEC | block / caution | Executes a download via shell substitution: `$(curl …)`, backtick curl/wget, `<(curl …)` (BLOCK). A substitution that only captures the download into a variable that is never executed — e.g. a Makefile `$(shell …)` assignment — is CAUTION |
+| ENV_INJECTION | caution | Touches `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` / `PYTHONSTARTUP`, or writes a fixed-name file under `/tmp` and makes it executable or runs it |
+| ENV_INJECTION_INSTALL | block | An install-time or server-start context (npm lifecycle script, `setup.py`, MCP manifest env, a `.pth` startup file) sets `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` / `PYTHONSTARTUP` / (install contexts) `PYTHONPATH`, or a `.pth` file carries an `import` line |
+| SCAN_INCOMPLETE | caution | Some content could not be scanned, or nothing was scanned — the verdict is partial. Includes compiled code with no inspectable source: a `.pyc` with no matching `.py`, or a native binary in a folder with no source at all |
 
 Every rule ships with a plain-English reason in the report, so a
 non-specialist can understand *why* something was flagged.
@@ -225,6 +235,15 @@ challenges it, by design of static analysis:
   at 100,000 characters. Hitting a budget is reported as a suspicious
   skip and forces `SCAN_INCOMPLETE`, so a huge folder degrades to
   CAUTION — never to a silent PASS and never to a hang.
+- **Concealment and phrase checks are mechanics, not meaning.**
+  `HIDDEN_TEXT` / `MARKDOWN_CONCEALMENT` detect invisible characters
+  and hidden elements; `NON_ENGLISH_INSTRUCTION` matches a fixed
+  phrase list in 14 languages. None of them understands what prose
+  *means*: a novel phrasing, an uncovered language, or a purely
+  semantic deception still passes — see the coverage map's Gap B.
+  Ordinary multilingual text is deliberately protected (single
+  zero-width joiners in Persian/Indic/emoji contexts do not fire), so
+  the trade is recall, not false alarms on real-world text.
 
 ### Scanner hardening
 
@@ -265,21 +284,22 @@ python3 run_mutation_tests.py  # 17 evasion mutations — all must BLOCK
 python3 run_edge_tests.py      # FIFO hang, oversize, empty, usage codes, UTF-16
 python3 run_security_tests.py  # hostile folders vs the scanner itself (see below)
 python3 run_v02_tests.py       # v0.2: secrets, metadata, browser stores, reverse shells, error leaks, npm/PyPI targets, Cursor rules, repo URLs, SARIF, Action + hook (fixtures are inert and built in a temp dir)
+python3 run_v03_tests.py       # v0.3: hidden text (zero-width/Tags/BiDi/comments), non-English instruction phrases, Markdown concealment, substitution exec, session sends, bytecode honesty, env injection, OWASP metadata (fixtures are inert and built in a temp dir)
 ```
 
 ## Coverage against published audits
 
 [`docs/AUDIT_COVERAGE.md`](docs/AUDIT_COVERAGE.md) maps 25 techniques
 from four published audits of real malicious skills / MCP servers
-against the 34 rules above. Summary (Covered / Partial / Gap per audit):
+against the 41 rules above. Summary (Covered / Partial / Gap per audit):
 
 | Audit | Covered | Partial | Gap |
 |-------|---------|---------|-----|
 | Snyk — ToxicSkills, Feb 2026 (3,984 skills scanned) | 3 | 5 | 3 |
 | Koi Security — ClawHavoc, Feb 2026 (341 malicious skills) | 1 | 4 | 2 |
-| Invariant Labs — MCP Tool Poisoning, Apr 2025 | 0 | 1 | 3 |
+| Invariant Labs — MCP Tool Poisoning, Apr 2025 | 0 | 2 | 2 |
 | Koi Security — postmark-mcp backdoor, Sep 2025 | 0 | 2 | 1 |
-| **Total (25 techniques)** | **4** | **12** | **9** |
+| **Total (25 techniques)** | **4** | **13** | **8** |
 
 The honest pattern: SkillScan is strong on the *code-shaped* half of
 these audits (credential reads, network exfiltration, decode-and-run
@@ -298,11 +318,19 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 RakTikoo.
 
 ## Status
 
-v0.2. v0.1 was a Week 1 spike hardened by adversarial review; v0.2 adds
+v0.3. v0.1 was a Week 1 spike hardened by adversarial review; v0.2 adds
 secret detection, cloud-metadata and browser-store rules, raw-socket
 reverse-shell detection, error-leak detection, npm/PyPI package
 targets, Cursor-rules handling, repo-URL scanning, SARIF output, and
-toolchain integration (GitHub Action + pre-install hook). Expect false
+toolchain integration (GitHub Action + pre-install hook). v0.3 adds
+concealment mechanics (zero-width / Unicode Tags / BiDi characters,
+instruction-carrying HTML comments, Markdown hiding places),
+non-English instruction phrases in 14 languages, shell-substitution
+execution, sends through session/client objects, compiled-code
+coverage honesty (bytecode or native binaries with no inspectable
+source can no longer read as clean), environment-injection shapes
+(LD_PRELOAD and friends, predictable temp files), and OWASP mapping
+metadata on every rule. Expect false
 positives and false negatives; the rule set and corpus are the starting
 point, not the finished product. Issues and new evasion samples are
 welcome — a mutation that evades SkillScan is a valuable contribution.
