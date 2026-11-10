@@ -25,6 +25,30 @@ def _rule(rule_id: str, severity: str, reason: str, pattern: str) -> Rule:
     return Rule(rule_id, severity, reason, re.compile(pattern, re.IGNORECASE))
 
 
+def _metadata_pattern() -> str:
+    """Cloud metadata endpoints in every cheap textual form: dotted IP,
+    decimal-integer IP (2852039166), hex IP (0xa9fea9fe), the AWS IPv6
+    endpoint, the Google hostname, and the well-known paths (including
+    the IMDSv2 token path /latest/api/token). The integer/hex forms are
+    computed from the dotted constants so they cannot drift apart."""
+    parts = [
+        r"169\.254\.169\.254", r"169\.254\.170\.2",
+        r"metadata\.google\.internal", r"metadata\.goog\b",
+        r"/latest/meta-data/", r"/latest/api/token",
+        r"/computeMetadata/v1/", r"fd00:ec2::254",
+    ]
+    for dotted in ("169.254.169.254", "169.254.170.2"):
+        value = 0
+        for octet in dotted.split("."):
+            value = (value << 8) + int(octet)
+        parts.append(rf"\b{value}\b")          # decimal form
+        parts.append(rf"0x0*{value:x}\b")      # hex form
+    return "(" + "|".join(parts) + ")"
+
+
+METADATA_PATTERN = _metadata_pattern()
+
+
 RULES: list[Rule] = [
     _rule(
         "SSH_CREDENTIAL_READ", "block",
@@ -41,8 +65,10 @@ RULES: list[Rule] = [
     _rule(
         "ENV_FILE_READ", "block",
         "Reads a .env file, where API keys and passwords are commonly stored. "
-        "(JS process.env is environment access, not this rule.)",
-        r"((?<![\w])\.env\b|dotenv|load_dotenv)",
+        "(JS process.env is environment access, not this rule. Placeholder "
+        "templates such as .env.example / .env.sample / .env.template are "
+        "not flagged — they hold no real values.)",
+        r"((?<![\w])\.env\b(?!\.(example|sample|template|dist|defaults)\b)|dotenv|load_dotenv)",
     ),
     _rule(
         "ENVIRON_SECRET_ACCESS", "caution",
@@ -183,6 +209,97 @@ RULES: list[Rule] = [
         r"(?!)never-matches-line-level",  # manifest-level, scanner.py
     ),
     _rule(
+        "HARDCODED_SECRET_LIVE", "block",
+        "Contains a credential in an unambiguous live format (an AWS "
+        "access-key id, a GitHub or GitLab token, an sk- API key, a "
+        "Stripe live key, an npm token, a Slack token, or a private-key "
+        "block) written directly into the skill. Real keys "
+        "do not belong inside installable code — treat this one as "
+        "compromised. Placeholder values and clearly-marked documentation "
+        "examples are deliberately not flagged.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "HARDCODED_SECRET_GENERIC", "caution",
+        "Assigns a long, high-entropy literal to a password / secret / "
+        "token / api-key variable. It may be an innocent test value, but "
+        "hardcoded credentials in shipped code have a way of being real — "
+        "check it, and prefer environment variables. Obvious placeholders "
+        "and environment-variable references are not flagged.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "CLOUD_METADATA_ACCESS", "caution",
+        "References a cloud metadata endpoint (169.254.169.254, "
+        "169.254.170.2, metadata.google.internal, /latest/meta-data/) "
+        "in dotted, decimal-integer, hex, or IPv6 form, or the IMDSv2 "
+        "token path. That service hands out temporary cloud credentials "
+        "to anything that can reach it, so a skill has almost no "
+        "legitimate reason to talk to it — on its own this is a caution; "
+        "combined with an outbound send it becomes a block "
+        "(CLOUD_METADATA_EXFIL). Sending TO the metadata endpoint itself "
+        "(the IMDSv2 token PUT) is this rule, not exfiltration.",
+        METADATA_PATTERN,
+    ),
+    _rule(
+        "CLOUD_METADATA_EXFIL", "block",
+        "This skill reaches a cloud metadata endpoint (a source of live "
+        "cloud credentials) AND reads credential material or has a way "
+        "to send data out over the network. That is the cloud "
+        "credential-theft shape.",
+        r"(?!)never-matches-line-level",  # scan-level combination, scanner.py
+    ),
+    _rule(
+        "BROWSER_CREDENTIAL_STORE", "caution",
+        "Touches browser or wallet credential storage (browser profile "
+        "password/cookie stores such as Login Data, logins.json, key4.db, "
+        "Local State, browser profile directories, or wallet extension "
+        "storage). Reading these is what stealer malware does; a skill "
+        "that also sends data out is blocked as EXFIL_COMBINATION.",
+        r"(Login Data\b|logins\.json|key4\.db|cookies\.sqlite|Local State\b|"
+        r"Local Extension Settings|nkbihfbeogaeaoehlefnkodbefgpgknn|"
+        r"wallet\.dat|\.electrum\b|google-chrome\b|BraveSoftware|"
+        r"Chrome[/\\]User Data|Edge[/\\]User Data|mozilla[/\\]firefox|"
+        r"User Data[/\\](Default|Profile))",
+    ),
+    _rule(
+        "REVERSE_SHELL", "block",
+        "Builds a raw-socket reverse shell: it opens a socket connection "
+        "and wires it to a shell (socket fd duplication with dup2, "
+        "pty.spawn, /dev/tcp, or spawning /bin/sh alongside a socket). "
+        "That hands an interactive shell on this machine to whoever is "
+        "listening at the other end.",
+        r"(?!)never-matches-line-level",  # file-level check in scanner.py
+    ),
+    _rule(
+        "ERROR_INFO_LEAK", "caution",
+        "Returns raw exception text, a formatted stack trace, or an "
+        "environment dump as a tool result. Whatever calls the tool "
+        "(including the model) then sees internal paths, messages and "
+        "possibly secrets that were in the environment. Logging the "
+        "error and returning a plain message is the safe shape and is "
+        "not flagged.",
+        r"(return[^\n]*(traceback\.format_exc|format_exc\s*\())",
+    ),
+    _rule(
+        "PACKAGE_INSTALL_SCRIPT", "caution",
+        "This package runs code automatically at install time: an npm "
+        "lifecycle script (preinstall / install / postinstall / prepare) "
+        "or a setup.py that does more than declare metadata (subprocess, "
+        "network, sockets). Install-time code runs before you ever call "
+        "the tool — read it before installing.",
+        r"(?!)never-matches-line-level",  # manifest-level, scanner.py
+    ),
+    _rule(
+        "PACKAGE_INSTALL_SCRIPT_EXEC", "block",
+        "An install-time script downloads or executes outside code "
+        "(curl/wget download, pipe to a shell, encoded payload, network "
+        "fetch from a script). Code fetched at install time is never "
+        "reviewed before it runs — this is the classic malicious-package "
+        "shape.",
+        r"(?!)never-matches-line-level",  # manifest-level, scanner.py
+    ),
+    _rule(
         "SCAN_INCOMPLETE", "caution",
         "Some content in this folder could not be scanned (unreadable, "
         "oversized, special file, symlink, or nothing was scanned at all). "
@@ -197,5 +314,8 @@ RULES_BY_ID = {rule.id: rule for rule in RULES}
 FILE_LEVEL_RULE_IDS = {
     "DECODE_AND_RUN", "EXFIL_COMBINATION", "MCP_UNRESTRICTED_EXEC",
     "MCP_UNRESTRICTED_READ", "MCP_SERVER_COMMAND", "SCAN_INCOMPLETE",
+    "HARDCODED_SECRET_LIVE", "HARDCODED_SECRET_GENERIC",
+    "CLOUD_METADATA_EXFIL", "REVERSE_SHELL",
+    "PACKAGE_INSTALL_SCRIPT", "PACKAGE_INSTALL_SCRIPT_EXEC",
 }
 LINE_RULES = [r for r in RULES if r.id not in FILE_LEVEL_RULE_IDS]
