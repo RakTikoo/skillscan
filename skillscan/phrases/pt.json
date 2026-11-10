@@ -1,0 +1,29 @@
+{
+  "code": "pt",
+  "language": "Portuguese",
+  "cjk": false,
+  "override": [
+    "ignore as instruções anteriores",
+    "ignore todas as instruções anteriores",
+    "ignore as instruções acima"
+  ],
+  "send": [
+    "envie",
+    "envia",
+    "roube",
+    "faça upload"
+  ],
+  "target": [
+    "senha",
+    "senhas",
+    "credenciais",
+    "chave ssh",
+    "token",
+    ".ssh"
+  ],
+  "conceal": [
+    "não diga ao usuário",
+    "não conte ao usuário",
+    "oculte isso do usuário"
+  ]
+}
