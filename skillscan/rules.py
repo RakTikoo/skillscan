@@ -19,10 +19,66 @@ class Rule:
     severity: str  # "block" or "caution"
     reason: str
     pattern: re.Pattern
+    # OWASP mapping: categories from the OWASP LLM Top 10 (2025) and the
+    # OWASP MCP Top 10 this rule's technique belongs to, e.g. "LLM02,
+    # MCP01". Empty string where no category sensibly applies. Metadata
+    # only — it never affects the verdict; it exists so findings can be
+    # triaged in the taxonomies security teams already use.
+    owasp: str = ""
+
+
+# The OWASP mapping for every rule, kept in one table so it can be
+# reviewed at a glance. LLM codes are the OWASP LLM Top 10 (2025);
+# MCP codes are the OWASP MCP Top 10.
+_OWASP_MAP: dict[str, str] = {
+    "SSH_CREDENTIAL_READ": "LLM02, MCP01",
+    "CLOUD_CREDENTIAL_READ": "LLM02, MCP01",
+    "ENV_FILE_READ": "LLM02, MCP01",
+    "ENVIRON_SECRET_ACCESS": "LLM02, MCP01",
+    "NETWORK_ACCESS": "",
+    "NETWORK_SEND_DATA": "LLM02",
+    "SHELL_SUBPROCESS": "LLM06, MCP05",
+    "SHELL_OS_SYSTEM": "LLM06, MCP05",
+    "EVAL_EXEC": "LLM06, MCP05",
+    "BASE64_OBFUSCATION": "MCP03",
+    "DECODE_AND_RUN": "MCP03, MCP05",
+    "CURL_PIPE_BASH": "LLM03, MCP04, MCP05",
+    "FILE_DELETE": "LLM06",
+    "RM_RF": "LLM06",
+    "PERSISTENCE": "LLM06",
+    "HOME_OR_SYSTEM_WRITE": "",
+    "CHMOD_CHOWN": "",
+    "RUNTIME_PACKAGE_INSTALL": "LLM03, MCP04",
+    "DYNAMIC_IMPORT": "LLM03, MCP04",
+    "CREDENTIAL_ENUMERATION": "LLM02, MCP01",
+    "EXFIL_COMBINATION": "LLM02",
+    "MCP_UNRESTRICTED_EXEC": "LLM06, MCP02, MCP05",
+    "MCP_UNRESTRICTED_READ": "LLM02, MCP10",
+    "MCP_SERVER_COMMAND": "MCP05, MCP09",
+    "HARDCODED_SECRET_LIVE": "LLM02, MCP01",
+    "HARDCODED_SECRET_GENERIC": "LLM02, MCP01",
+    "CLOUD_METADATA_ACCESS": "LLM02, MCP01",
+    "CLOUD_METADATA_EXFIL": "LLM02, MCP01",
+    "BROWSER_CREDENTIAL_STORE": "LLM02, MCP01",
+    "REVERSE_SHELL": "MCP05",
+    "ERROR_INFO_LEAK": "LLM02, MCP10",
+    "PACKAGE_INSTALL_SCRIPT": "LLM03, MCP04",
+    "PACKAGE_INSTALL_SCRIPT_EXEC": "LLM03, MCP04, MCP05",
+    "SCAN_INCOMPLETE": "",
+    "HIDDEN_TEXT": "LLM01, MCP03, MCP06",
+    "NON_ENGLISH_INSTRUCTION": "LLM01, MCP06",
+    "ANY_LANGUAGE_STRUCTURE": "LLM01, MCP06",
+    "MARKDOWN_CONCEALMENT": "LLM01, MCP03, MCP06",
+    "SUBSTITUTION_EXEC": "LLM03, MCP05",
+    "ENV_INJECTION": "LLM06, MCP05",
+    "ENV_INJECTION_INSTALL": "LLM03, MCP04, MCP05",
+}
 
 
 def _rule(rule_id: str, severity: str, reason: str, pattern: str) -> Rule:
-    return Rule(rule_id, severity, reason, re.compile(pattern, re.IGNORECASE))
+    return Rule(rule_id, severity, reason,
+                re.compile(pattern, re.IGNORECASE),
+                owasp=_OWASP_MAP.get(rule_id, ""))
 
 
 def _metadata_pattern() -> str:
@@ -300,6 +356,94 @@ RULES: list[Rule] = [
         r"(?!)never-matches-line-level",  # manifest-level, scanner.py
     ),
     _rule(
+        "HIDDEN_TEXT", "block",
+        "Text is concealed with invisible or deceptive characters: "
+        "zero-width characters, Unicode Tags-block characters (which can "
+        "encode a whole hidden instruction), bidirectional control "
+        "characters that make text display differently from how it "
+        "reads, or an HTML comment carrying instruction-like content. "
+        "Hidden text in a skill's instructions or a tool description is "
+        "read by the agent but not by you. (Severity is CAUTION for the "
+        "character-level indicators; it is BLOCK only when a decoded "
+        "Tags-block payload contains instruction keywords. A single "
+        "zero-width joiner in ordinary multilingual text does not fire.)",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "NON_ENGLISH_INSTRUCTION", "caution",
+        "Instruction-attack phrasing in a language other than English: "
+        "an override of earlier instructions, a request to send or steal "
+        "credential material, or an instruction to keep something from "
+        "the user, in one of the covered languages (Spanish, French, "
+        "German, Polish, Turkish, Chinese, Japanese, Russian, Hindi, "
+        "Portuguese, Arabic, Korean, Indonesian, Ukrainian). The phrase "
+        "lists are data files (skillscan/phrases/<code>.json) — adding "
+        "a language means adding one file. This is a phrase list, not "
+        "an understanding of the language — it catches the known shapes "
+        "and is stated as a heuristic.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "ANY_LANGUAGE_STRUCTURE", "caution",
+        "An instruction surface (documentation or a tool description) "
+        "in ANY language pairs a private credential-store location "
+        "(~/.ssh, ~/.aws, a .env file, an SSH key file, a browser "
+        "credential store) with an outbound destination or fetch "
+        "command (a URL, an IP address, an email address, curl/wget, "
+        "a webhook). That pairing is the exfiltration shape whatever "
+        "language the prose is in, so this rule needs no phrase list. "
+        "It deliberately requires the private-store anchor: a guide "
+        "that tells users to send their own API token to the service's "
+        "own API URL is normal documentation and does not fire, and "
+        "safety prose warning against the shape does not fire either.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "MARKDOWN_CONCEALMENT", "caution",
+        "Content is hidden from a human reader with presentation "
+        "tricks — a display:none or visibility:hidden element, "
+        "invisible (zero-size / fully transparent / white-on-white / "
+        "off-screen-positioned) text, or a hidden attribute — and "
+        "the hidden content contains instruction-like wording. The "
+        "agent reading the raw file sees what the rendered page hides. "
+        "(A plain <details> element is a disclosure widget, not "
+        "concealment, and does not fire on its own.)",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "SUBSTITUTION_EXEC", "block",
+        "Executes a download through shell substitution — $(curl …), "
+        "$(wget …), backtick curl/wget, or process substitution "
+        "<(curl …) — so the downloaded content runs as part of another "
+        "command instead of travelling down a visible pipe. It is the "
+        "quieter sibling of curl | bash: the fetched code is never "
+        "reviewed before it runs. (A substitution that only CAPTURES "
+        "the download into a variable that is never executed — a "
+        "version check fetching a release number — is the same shape "
+        "at CAUTION severity, not BLOCK.)",
+        r"(\$\(\s*(sudo\s+)?(curl|wget)\b|`\s*(curl|wget)\b|<\s*\(\s*(curl|wget)\b)",
+    ),
+    _rule(
+        "ENV_INJECTION", "caution",
+        "Touches loader / interpreter injection points: LD_PRELOAD, "
+        "DYLD_INSERT_LIBRARIES or PYTHONSTARTUP (which make other "
+        "programs load this code), or writes a file to a predictable "
+        "path under /tmp and then makes it executable or runs it — the "
+        "fixed-name temp file another process can be tricked into "
+        "loading or racing. Setting these at install time is blocked "
+        "separately (ENV_INJECTION_INSTALL).",
+        r"\b(LD_PRELOAD|DYLD_INSERT_LIBRARIES|PYTHONSTARTUP)\b",
+    ),
+    _rule(
+        "ENV_INJECTION_INSTALL", "block",
+        "An install-time or server-start context sets LD_PRELOAD, "
+        "DYLD_INSERT_LIBRARIES or PYTHONSTARTUP: an npm lifecycle "
+        "script, a setup.py, or an MCP manifest environment entry. "
+        "That makes every later program on the machine load the "
+        "skill's code — persistence and code injection in one line.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
         "SCAN_INCOMPLETE", "caution",
         "Some content in this folder could not be scanned (unreadable, "
         "oversized, special file, symlink, or nothing was scanned at all). "
@@ -317,5 +461,8 @@ FILE_LEVEL_RULE_IDS = {
     "HARDCODED_SECRET_LIVE", "HARDCODED_SECRET_GENERIC",
     "CLOUD_METADATA_EXFIL", "REVERSE_SHELL",
     "PACKAGE_INSTALL_SCRIPT", "PACKAGE_INSTALL_SCRIPT_EXEC",
+    "HIDDEN_TEXT", "NON_ENGLISH_INSTRUCTION", "MARKDOWN_CONCEALMENT",
+    "ENV_INJECTION_INSTALL", "SUBSTITUTION_EXEC",
+    "ANY_LANGUAGE_STRUCTURE",
 }
 LINE_RULES = [r for r in RULES if r.id not in FILE_LEVEL_RULE_IDS]
