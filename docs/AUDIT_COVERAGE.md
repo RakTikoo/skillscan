@@ -1,6 +1,6 @@
 # Audit coverage map
 
-How SkillScan v0.2's 34 deterministic rules line up against the techniques
+How SkillScan v0.3's 41 deterministic rules line up against the techniques
 documented in published audits of real malicious AI-agent skills and MCP
 servers.
 
@@ -10,10 +10,10 @@ servers.
   audits. No report text and no malicious code from any audit is reproduced
   here.
 - "Evidence" means one thing only: an **existing** sample in `samples/` or
-  `samples-mutations/`, or a fixture in `run_v02_tests.py` (the v0.2 suite
-  builds inert fixtures in a temp dir), that an existing test suite already
-  scans, with the verdict that suite asserts. No new sample was created
-  for this map beyond what those suites contain.
+  `samples-mutations/`, or a fixture in `run_v02_tests.py` / `run_v03_tests.py`
+  (those suites build inert fixtures in a temp dir), that an existing test
+  suite already scans, with the verdict that suite asserts. No new sample
+  was created for this map beyond what those suites contain.
 - Where a rule plausibly addresses a technique but no existing sample
   exercises it that way, the evidence column says so —
   *"rule present, no dedicated sample yet"* — instead of implying a test
@@ -30,9 +30,9 @@ servers.
 |-------|-------------------|---------|---------|-----|
 | Snyk — ToxicSkills (Feb 2026) | 11 | 3 | 5 | 3 |
 | Koi Security — ClawHavoc (Feb 2026) | 7 | 1 | 4 | 2 |
-| Invariant Labs — MCP Tool Poisoning (Apr 2025) | 4 | 0 | 1 | 3 |
+| Invariant Labs — MCP Tool Poisoning (Apr 2025) | 4 | 0 | 2 | 2 |
 | Koi Security — postmark-mcp (Sep 2025) | 3 | 0 | 2 | 1 |
-| **Total** | **25** | **4** | **12** | **9** |
+| **Total** | **25** | **4** | **13** | **8** |
 
 The pattern in that tally is honest and worth understanding: SkillScan is
 strong on the *code-shaped* half of these audits (credential reads, network
@@ -57,7 +57,7 @@ doing the work). That weakness is structural — see the Gaps section.
 | S3 | The skill's *instructions* (SKILL.md prose) tell the agent/user to fetch and install untrusted software from an outside location, including archives a scanner cannot see inside | **Partial** | CURL_PIPE_BASH, RUNTIME_PACKAGE_INSTALL, NETWORK_ACCESS (all line rules also run over documentation) | Rule present, no dedicated sample yet. Documentation findings are deliberately capped at CAUTION and negated safety prose is skipped (scanner design), so a prose-only install instruction can never produce a BLOCK from SkillScan. No existing sample puts the download instruction in prose only |
 | S4 | Obfuscated exfiltration commands are embedded in installation instructions rather than in code files | **Partial** | BASE64_OBFUSCATION, DECODE_AND_RUN, SSH_CREDENTIAL_READ, CLOUD_CREDENTIAL_READ (line rules run over `.md` too) | Rule present, no dedicated sample yet — the corpus's obfuscated samples keep the payload in code (`samples/bad/obfuscated-dropper`, mutation 10). In prose, DECODE_AND_RUN's block severity is capped to CAUTION like every documentation finding |
 | S5 | Instructions push the agent to weaken the machine: alter service/startup configuration so a backdoor persists, delete system files, loosen security settings | **Partial** | PERSISTENCE, RM_RF, FILE_DELETE, CHMOD_CHOWN | In *code* these fire at full severity — PERSISTENCE/RM_RF are exercised by the corpus's shell-shaped samples (e.g. `samples-mutations/06-shell-home-var`, BLOCK) and FILE_DELETE by `samples/caution/shell-automation` (CAUTION, asserted by `run_tests.py`). In *prose* the same words are capped at CAUTION; a dedicated persistence sample does not exist, so for PERSISTENCE specifically: rule present, no dedicated sample yet |
-| S6 | Prompt-injection wording in skill text: hidden or deceptive instructions outside the skill's stated purpose, "ignore previous instructions"-style overrides, fake system-message framing, Unicode/base64-smuggled instructions | **Partial** | — (no prompt-injection rule exists) | Only the encoding half is visible: if the smuggled text uses base64 in a scannable file, BASE64_OBFUSCATION fires at most (CAUTION in documentation). No existing sample exercises instruction-override wording, and no rule judges whether prose is *deceptive* — that is a semantic judgement a regex rule set does not make |
+| S6 | Prompt-injection wording in skill text: hidden or deceptive instructions outside the skill's stated purpose, "ignore previous instructions"-style overrides, fake system-message framing, Unicode/base64-smuggled instructions | **Partial** | BASE64_OBFUSCATION; v0.3: HIDDEN_TEXT, MARKDOWN_CONCEALMENT, NON_ENGLISH_INSTRUCTION | The *mechanics* half is now covered with fixtures: `run_v03_tests.py` proves Unicode Tags-block smuggling in a manifest description BLOCKs (and CAUTIONs without keywords), zero-width / BiDi / HTML-comment concealment CAUTIONs, Markdown hiding places (display:none, white-on-white, `<details>`) CAUTION, and instruction-attack phrases in 10 languages CAUTION — with benign multilingual controls (emoji ZWJ, Persian/Indic joiners, a Spanish cooking README) all PASS. The *meaning* half remains a Gap inside this Partial: no rule judges whether visible, plainly-worded prose is deceptive — that is a semantic judgement a deterministic rule set does not make |
 | S7 | Skills instruct the agent to print/echo secrets back, or ask the user to paste secrets into outputs or commands | **Gap** | — | No rule inspects instructions *about* credential handling in prose. ENVIRON_SECRET_ACCESS covers code touching the environment, not text asking a human or agent to reveal a secret |
 | S8 | Hardcoded secrets and tokens embedded in the skill itself (leaked keys, or deliberately embedded tokens for attacker infrastructure) | **Covered** | HARDCODED_SECRET_LIVE, HARDCODED_SECRET_GENERIC | v0.2 added secret detection: live-format credentials (AWS key ids, GitHub and GitLab tokens, `sk-` keys, Stripe live keys, npm tokens, Slack tokens, private-key blocks) BLOCK; long high-entropy literals assigned to secret-named variables (including a bare KEY / TOKEN / SECRET / PASSWORD name) CAUTION, as are Stripe *test* keys. `run_v02_tests.py` fixtures assert both tiers fire, and that placeholders (`your-api-key`, `changeme`, `xxxx`), env-var references, low-entropy values, and clearly-marked documentation examples do **not**. Honest limits: the generic tier's effective minimum is ~12 characters (an entropy floor of 3.5 bits/char, despite an 8-character regex floor), so secrets that are short, low-entropy, split across strings, or encoded are not caught; live-format values in test files or marked FAKE_/FIXTURE are downgraded to CAUTION rather than BLOCK; and a random-looking test value can trip the CAUTION tier |
 | S9 | Content the skill fetches at run time from third parties carries injected instructions back to the agent (indirect injection through fetched content) | **Gap** | — (NETWORK_ACCESS flags that fetching happens, at CAUTION) | The fetched content does not exist in the folder at scan time, so there is nothing static to inspect. Flagging "this skill fetches remote content" is the only signal, and it is also true of most honest skills |
@@ -95,7 +95,7 @@ doing the work). That weakness is structural — see the Gaps section.
 
 | # | Technique (our words) | Coverage | Rule(s) | Evidence from existing suites |
 |---|------------------------|----------|---------|-------------------------------|
-| I1 | A tool's *description* (text the model reads but the user barely sees) secretly instructs the model to read sensitive local files — client config, SSH keys — and smuggle the contents back inside an ordinary-looking tool argument | **Gap** | — (MCP_UNRESTRICTED_EXEC / MCP_UNRESTRICTED_READ examine a manifest's declared tool *shape*, not the meaning of its description text) | No existing sample exercises description-text instructions; `samples-mutations/09-mcp-manifest` proves only the structural side (BLOCK; MCP_UNRESTRICTED_EXEC + MCP_UNRESTRICTED_READ fire on an unconstrained tool declaration). Judging that description prose is *asking for something hidden* is semantic prompt-injection judgement — no rule attempts it |
+| I1 | A tool's *description* (text the model reads but the user barely sees) secretly instructs the model to read sensitive local files — client config, SSH keys — and smuggle the contents back inside an ordinary-looking tool argument | **Partial** | MCP_UNRESTRICTED_EXEC / MCP_UNRESTRICTED_READ (declared shape); v0.3: HIDDEN_TEXT, NON_ENGLISH_INSTRUCTION (description concealment mechanics) | `samples-mutations/09-mcp-manifest` proves the structural side (BLOCK on an unconstrained tool declaration). v0.3 covers the *concealment* slice of the description attack: a description smuggling its instruction in Unicode Tags characters BLOCKs when the decoded payload carries instruction keywords, and zero-width/BiDi/HTML-comment hiding in descriptions CAUTIONs (`run_v03_tests.py` fixtures, including a manifest-description case). What remains a Gap inside this Partial: a description that asks for the same thing in plain, visible, novel wording — judging that prose is *asking for something hidden* is semantic, and no rule attempts it |
 | I2 | Shadowing: a description on one server redefines how the agent must treat a *different, trusted* server's tool (e.g. rerouting its output to the attacker), without the malicious tool ever being called | **Gap** | — | Requires reasoning about cross-server instruction semantics. SkillScan scans one folder at a time and never interprets description meaning. No rule, no sample |
 | I3 | Rug pull: a server that was reviewed and approved quietly changes its tool descriptions afterwards, so the installed behaviour is not the reviewed behaviour | **Gap** | — | A scan is a snapshot of one folder at one moment. Nothing in SkillScan pins hashes, versions, or re-checks a server after install. No rule can see a change that happens after the scan |
 | I4 | The exfiltration channel itself: stolen data leaves inside normal tool-call arguments to the connected server, and can be encoded first to make it less visible | **Partial** | BASE64_OBFUSCATION (encoding half only) | If a server *implementation in the folder* performs a network send, NETWORK_SEND_DATA / EXFIL_COMBINATION apply and are corpus-proven (see S1). But when the "send" is the model placing text into a tool argument of a remote server, there is no network code in the folder to flag — that half is a Gap inside this Partial. Rule present for the code half, no dedicated sample for the argument-channel half |
@@ -162,6 +162,150 @@ v0.2, unchanged: no v0.2 rule attempts to judge what instruction prose
 
 ---
 
+## v0.3 additions beyond these four audits
+
+The v0.3 families came from the project's competitor/issue-tracker
+research loop (what users of other scanners report missing), stated
+with the same honesty standard:
+
+- **Concealment mechanics** (HIDDEN_TEXT / MARKDOWN_CONCEALMENT) —
+  invisible-character smuggling (zero-width runs, Unicode Tags-block
+  payloads, BiDi controls), instruction-carrying HTML comments, and
+  Markdown hiding places (display:none, white-on-white, off-screen
+  positioning). This is the mechanics slice of S6/I1 and moves I1 to
+  Partial. A plain `<details>` element is NOT counted as a hiding
+  place (it is a disclosure widget; see the fix-pass notes below).
+  False-positive discipline is fixture-proven: emoji ZWJ sequences,
+  Persian/Indic joiners, a file-start BOM, benign HTML comments, and
+  benign hidden layout elements all PASS. Limits: variation-selector
+  payloads and homoglyph look-alikes are not decoded; a single
+  zero-width character in non-ASCII text without keywords is
+  deliberately not flagged.
+- **Non-English instruction phrases** (NON_ENGLISH_INSTRUCTION,
+  CAUTION) — the override / send-credentials / conceal-from-user
+  shapes in 14 languages (Spanish, French, German, Polish, Turkish,
+  Chinese, Japanese, Russian, Hindi, Portuguese, Arabic, Korean,
+  Indonesian, Ukrainian). The phrase lists are per-language JSON data
+  files (`skillscan/phrases/<code>.json`) — adding a language means
+  adding one file. It is a phrase list, not
+  language understanding: novel phrasing and other languages evade
+  it, and it is recorded here as a heuristic, not as closing the
+  semantic gap (section B stands).
+- **Substitution execution** (SUBSTITUTION_EXEC) — downloads
+  executed through `$(curl …)`, backtick, or `<(curl …)` substitution
+  rather than a pipe (BLOCK); a substitution that only CAPTURES the
+  download into a variable that is never executed — including a
+  Makefile `$(shell …)` assignment — is the same shape at CAUTION.
+  A sibling shape of S2/S10's download-and-run.
+- **Session/client sends** — sends through `requests.Session()` /
+  `httpx.Client()` / `aiohttp.ClientSession()` objects (variable-bound,
+  `with`-bound, attribute-bound as in `self.session`, or chained
+  onto the constructor) now resolve onto the library, so the S1/K5
+  exfiltration combination sees them; a session GET alone remains a
+  plain NETWORK_ACCESS caution.
+- **Compiled-code coverage honesty** — a `.pyc`/`.pyo` with no
+  matching `.py` source, or a native binary in a folder with no
+  source at all, is now a *suspicious* skip: the verdict cannot be a
+  clean PASS on code nobody inspected. Compiled artefacts shipped
+  alongside their source stay non-suspicious (fixture-proven both
+  ways). This addresses a failure mode reported against other
+  scanners (bytecode-only skills read as safe); it is a coverage
+  stance, not a detection rule. **Stated weakness (decoy):** the
+  pairing is by file NAME only — a folder can ship a harmless
+  `helper.py` beside a malicious `helper.pyc` and the bytecode reads
+  as a routine build artefact, because the scanner trusts the
+  source's presence as provenance and never compares the bytecode's
+  content against the source. Closing that would require decompiling
+  or executing the bytecode, both out of scope for this tool; the
+  stance is a tripwire against bytecode-ONLY folders, not a proof
+  that shipped bytecode matches its neighbouring source.
+- **Environment injection** (ENV_INJECTION / ENV_INJECTION_INSTALL)
+  — LD_PRELOAD / DYLD_INSERT_LIBRARIES / PYTHONSTARTUP references
+  (CAUTION), the same variables set from an install script, a
+  `setup.py`, or an MCP manifest env (BLOCK), and the
+  predictable-temp-path + make-executable shape (CAUTION). A new
+  family; no row in the four audits above maps to it.
+- **OWASP mapping metadata** — every rule now carries OWASP LLM Top
+  10 / MCP Top 10 category codes, surfaced in JSON findings and
+  SARIF rule metadata. Metadata only; it changes no verdict and no
+  coverage cell.
+
+## v0.3 fix pass (post-review corrections)
+
+v0.3 went through the standing multi-agent adversarial review
+(false-positive hunter, red team, code auditor). The fixes below are
+all regression-fixtured in `run_v03_tests.py`; behaviour that changed
+is stated, not smoothed over:
+
+- **Substitution severity is execution-aware.** `VAR=$(curl …)` that
+  is captured and never executed is CAUTION, not BLOCK; BLOCK is
+  reserved for executing contexts (command position, `eval`, `sh -c`,
+  pipes to a shell, process substitution, or a variable the same
+  file later executes). Quote-split command names (`cu''rl`) are
+  normalised before matching.
+- **Comment and concealment keyword bars are instruction-grade.**
+  HTML comments and Markdown-hidden content now require a strong
+  keyword or a send-verb WITH a credential target — a TODO comment
+  about sending an invoice template, or a hidden FAQ mentioning
+  "download", no longer fires. A plain `<details>` element is no
+  longer treated as concealment at all (disclosure widget); it needs
+  a real hiding style/attribute as well. Concealment reading now
+  covers off-screen positioning and reads to the element's matching
+  close tag (4000-char fallback), and HTML comments are checked
+  individually, concatenated (payloads split across comments), and
+  to end-of-file when unclosed.
+- **The test-banner exemption is content-based.** A comment is
+  skipped only when it is banner/safety text AND carries no
+  instruction-grade keywords; a banner phrase sharing a comment with
+  a payload no longer exempts the payload.
+- **Tags-block smuggling is checked file-wide.** All Tags runs in a
+  file are also decoded as one concatenation (a keyword split across
+  runs still BLOCKs), and a line carrying two or more Tags characters
+  in any arrangement — e.g. interleaved with zero-width characters —
+  is at least a CAUTION presence hit.
+- **Temp-path execution is path-tied.** ENV_INJECTION's /tmp shape
+  completes only when the execution context references the SAME path
+  (literal, or one hop through a variable bound to it); an unrelated
+  subprocess elsewhere in the file no longer completes it, and
+  negation prose is honoured.
+- **Sessions resolve through attributes.** `self.session = …`
+  bindings resolve like variables (previously only plain variables
+  did, inconsistently flagging one form and missing the other), and
+  `aiohttp.ClientSession` (including `async with`) is a known
+  constructor. Chosen semantics for ambiguity: when one name is bound
+  to objects of two different modules in a file, its sends are NOT
+  classified — a flat symbol table cannot tell which binding a call
+  site sees, and guessing manufactures both false positives and
+  false negatives (fixture-proven both ways).
+- **`.pth` files are a first-class startup surface.** Any `import`
+  line or environment/path manipulation in a `.pth` file is
+  ENV_INJECTION_INSTALL (BLOCK) — a `.pth` executes at every
+  interpreter startup. Plain path entries and comments pass.
+  PYTHONPATH joins the injection-variable set for install/startup
+  contexts (lifecycle commands, manifest command/args, `setup.py`,
+  `.pth`); it is deliberately NOT flagged as a bare MCP manifest
+  *env dict* entry, where pointing it at the server's own code is a
+  common legitimate configuration.
+- **JSON manifests are checked after parsing.** The hidden-text,
+  non-English and structure matchers also run over the parsed string
+  values of `.json` files, so `\uXXXX`-escaped payloads are caught
+  after decoding rather than only in raw text.
+- **`.pyc` pairing compares full stems** with the interpreter tag
+  stripped (`a.b.pyc` pairs with `a.b.py`; `x.cpython-312.pyc` pairs
+  with `x.py`). The name-presence decoy weakness above stands.
+- **ANY_LANGUAGE_STRUCTURE (new rule, CAUTION)** — on instruction
+  surfaces, the co-occurrence of a PRIVATE credential-store anchor
+  (`~/.ssh`, `~/.aws`, a `.env` file, an SSH key file, a browser
+  credential store) with an outbound anchor (URL, IP, email address,
+  curl/wget, webhook) fires in ANY language, no phrase list needed.
+  The anchor is deliberately the private store, not the word
+  "token": a guide telling users to send their own token to the
+  service's own API URL is normal documentation and passes, as does
+  negation-guarded safety prose (both fixture-proven; a malicious
+  shape written in Italian — a language with no phrase set — fires).
+
+---
+
 ## Gaps — the full honest list
 
 Every Gap and Partial above, grouped by *why* it is hard for this tool.
@@ -184,7 +328,11 @@ PASS.
   require judging what natural language *means and intends*. SkillScan's
   verdicts come from deterministic pattern rules precisely so they are
   reproducible; it has no instruction-semantics rule, and bolting an LLM
-  judge on would change the tool's core guarantee. This is the single
+  judge on would change the tool's core guarantee. v0.3 narrows this
+  class from the mechanics side — concealment characters, hiding
+  places, and known attack phrases in 14 languages (moving I1 to
+  Partial) — but the meaning itself remains unjudged, and S7/I2 are
+  untouched. This is the single
   largest gap class in the audits — Snyk found prompt injection in the
   overwhelming majority of confirmed malicious skills, usually *combined*
   with the code patterns SkillScan does catch (which is why the code half
@@ -242,6 +390,6 @@ PASS.
 
 *Map compiled from the four audits above and the scanner source
 (`skillscan/rules.py`, `skillscan/scanner.py`) and test suites as of
-v0.2.0. If a rule or a sample changes, this map must change with it — a
+v0.3.0. If a rule or a sample changes, this map must change with it — a
 coverage claim without a suite behind it is exactly the kind of thing
 this document exists to prevent.*
