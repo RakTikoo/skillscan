@@ -1,0 +1,31 @@
+{
+  "code": "fr",
+  "language": "French",
+  "cjk": false,
+  "override": [
+    "ignore les instructions précédentes",
+    "ignorez les instructions précédentes",
+    "ignore toutes les instructions"
+  ],
+  "send": [
+    "envoie",
+    "envoyez",
+    "vole",
+    "volez"
+  ],
+  "target": [
+    "mot de passe",
+    "mots de passe",
+    "identifiants",
+    "clé ssh",
+    "jeton",
+    "token",
+    ".ssh",
+    "id_rsa"
+  ],
+  "conceal": [
+    "ne le dis pas à l'utilisateur",
+    "sans le dire à l'utilisateur",
+    "cache ceci à l'utilisateur"
+  ]
+}
