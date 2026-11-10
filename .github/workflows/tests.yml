@@ -30,3 +30,5 @@ jobs:
         run: python3 run_security_tests.py
       - name: v0.2 features (secrets, metadata, packages, SARIF, toolchain)
         run: python3 run_v02_tests.py
+      - name: v0.3 features (hidden text, non-English phrases, concealment, sessions, bytecode honesty, env injection, OWASP)
+        run: python3 run_v03_tests.py
