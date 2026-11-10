@@ -312,6 +312,54 @@ for every cell. Read it before trusting a PASS.
 Each suite scans samples as subprocesses, asserts verdicts and exit
 codes, and exits non-zero on any failure.
 
+## Benchmarks
+
+SkillScan's own measured rates on a public labelled corpus —
+**MaliciousSkillBench** (9,740 labelled skills, pinned at commit
+`893afd6`), run 2026-11-10 with SkillScan **v0.3.0**. Malicious skills
+were scanned as complete extracted folders; benign skills are shipped
+by the benchmark as frozen text, so each was scanned as a single
+`SKILL.md` folder. Nothing was executed — folders were read as text
+only. Full methodology, counting rules and caveats:
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+| Set | Skills | BLOCK | CAUTION | PASS |
+|-----|--------|-------|---------|------|
+| Malicious | 7,421 | **45.9%** (3,409) | 35.8% (2,659) | 18.2% (1,353) |
+| Benign | 2,235 | 0.67% false BLOCKs (15) | 25.9% (578) | 73.5% (1,642) |
+
+Detection by attack family (multi-label membership; BLOCK /
+BLOCK+CAUTION):
+
+| Family | Skills | BLOCK | BLOCK+CAUTION |
+|--------|--------|-------|---------------|
+| Privilege / tool-authority abuse | 1,004 | 74.6% | 99.1% |
+| Execution / code delivery | 3,205 | 74.2% | 95.6% |
+| Credential access | 197 | 55.8% | 94.9% |
+| Persistence / control | 249 | 55.4% | 90.0% |
+| Instruction / goal manipulation | 1,560 | 63.7% | 87.8% |
+| Data exfiltration / disclosure | 266 | 35.3% | 82.3% |
+| Resource / availability abuse | 330 | 22.7% | 91.2% |
+| Dependency / supply chain | 167 | 12.0% | 88.6% |
+| Integrity / output manipulation | 97 | 1.0% | 32.0% |
+
+Honest limits, stated plainly:
+
+- **Most misses are prose-only skills.** 984 of the 1,353 missed
+  malicious skills are a single `SKILL.md` with no code at all. Among
+  *pure* instruction-manipulation skills the BLOCK rate is 9.0%, and
+  pure output manipulation is ~1% — deterministic rules see behaviour
+  shapes, not meaning.
+- **The benign side is prose-only** (see above), so the false-BLOCK
+  figure measures prose-triggered false alarms, not code-triggered
+  ones. That asymmetry is part of the corpus, and it is disclosed
+  rather than smoothed over.
+- **v0.3 has a known false-positive regression:** all 15 benign false
+  BLOCKs (0.67%) come from one rule (`SUBSTITUTION_EXEC`) firing at
+  block severity on command-substitution examples inside benign
+  documentation. A fix is in progress; the number is published as
+  measured, not after the fix.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE). Copyright (c) 2026 RakTikoo.
