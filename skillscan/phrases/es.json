@@ -1,0 +1,33 @@
+{
+  "code": "es",
+  "language": "Spanish",
+  "cjk": false,
+  "override": [
+    "ignora las instrucciones anteriores",
+    "ignora todas las instrucciones anteriores",
+    "ignora las instrucciones previas"
+  ],
+  "send": [
+    "envía",
+    "envia",
+    "manda",
+    "sube",
+    "roba",
+    "extrae"
+  ],
+  "target": [
+    "contraseña",
+    "contrasena",
+    "credenciales",
+    "clave",
+    "token",
+    ".ssh",
+    "id_rsa"
+  ],
+  "conceal": [
+    "no le digas al usuario",
+    "sin decirle al usuario",
+    "oculta esto al usuario",
+    "no le cuentes al usuario"
+  ]
+}
