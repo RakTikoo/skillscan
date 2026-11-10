@@ -28,3 +28,5 @@ jobs:
         run: python3 run_edge_tests.py
       - name: Security (hostile folders)
         run: python3 run_security_tests.py
+      - name: v0.2 features (secrets, metadata, packages, SARIF, toolchain)
+        run: python3 run_v02_tests.py
