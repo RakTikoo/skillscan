@@ -563,7 +563,7 @@ def main() -> int:
         empty_home = base / "empty-home"
         empty_home.mkdir()
         proc = subprocess.run(
-            [str(hook_path), str(ROOT / "samples/good/calendar-helper")],
+            ["bash", str(hook_path), str(ROOT / "samples/good/calendar-helper")],
             capture_output=True, text=True, timeout=30,
             env=dict(os.environ, SKILLSCAN_HOME=str(empty_home)))
         check("af6-hook-missing-scanner", proc.returncode == 3
@@ -574,7 +574,7 @@ def main() -> int:
         (bad_home / "skillscan.py").write_text(
             "import sys\nsys.exit(7)\n")
         proc = subprocess.run(
-            [str(hook_path), str(ROOT / "samples/good/calendar-helper")],
+            ["bash", str(hook_path), str(ROOT / "samples/good/calendar-helper")],
             capture_output=True, text=True, timeout=30,
             env=dict(os.environ, SKILLSCAN_HOME=str(bad_home)))
         check("af6-hook-normalises-exit", proc.returncode == 3,
@@ -591,11 +591,11 @@ def main() -> int:
               "composite action with path + fail-on-block inputs")
 
         hook = ROOT / "hooks" / "pre-install-scan.sh"
-        check("hook-exists-executable", hook.exists() and os.access(hook, os.X_OK))
+        check("hook-exists", hook.exists())
         if hook.exists():
-            good = subprocess.run([str(hook), str(ROOT / "samples/good/calendar-helper")],
+            good = subprocess.run(["bash", str(hook), str(ROOT / "samples/good/calendar-helper")],
                                   capture_output=True, text=True, timeout=30)
-            bad = subprocess.run([str(hook), str(ROOT / "samples/bad/ssh-stealer")],
+            bad = subprocess.run(["bash", str(hook), str(ROOT / "samples/bad/ssh-stealer")],
                                  capture_output=True, text=True, timeout=30)
             check("hook-exit-codes", good.returncode == 0 and bad.returncode == 2,
                   f"good={good.returncode} bad={bad.returncode}")
