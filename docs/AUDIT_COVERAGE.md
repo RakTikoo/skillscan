@@ -1,6 +1,6 @@
 # Audit coverage map
 
-How SkillScan v0.5's 57 deterministic rules line up against the techniques
+How SkillScan v0.6's 59 deterministic rules line up against the techniques
 documented in published audits of real malicious AI-agent skills and MCP
 servers.
 
@@ -825,10 +825,323 @@ PASS.
   is not performed (EXFIL_COMBINATION works at skill level, not value
   level).
 
+## v0.6 additions — agent-config poisoning
+
+Two 2026 real-world reports (a skill re-assessment and a package
+report, both surfaced by the daily audit watch) document a shape
+the tables above did not name: a skill that silently rewrites the
+user's GLOBAL agent configuration — appending attacker
+instructions to `~/.claude/CLAUDE.md`, injecting SessionStart
+hooks into global settings, registering itself as an MCP server
+in a desktop app's config — and skills that read the agent's OWN
+credential stores. v0.5's PERSISTENCE rule covered crontab,
+shell profiles and systemd units, but not agent tooling, and no
+credential rule covered agent credential files. Rules 57 → 59.
+
+- **AGENT_CONFIG_WRITE (BLOCK in code, CAUTION in prose).** A
+  dedicated matcher, not a line rule, because the whole question
+  is GLOBAL versus the skill's own folder. A target counts only
+  with a home anchor (`~`, `$HOME`, `%USERPROFILE%`,
+  `Path.home()`, `expanduser`, `os.homedir()`, an absolute home
+  path, or a variable built from one) followed by an agent
+  location: `.claude/`, `.codex/`, `.gemini/`, `.config/` agent
+  dirs, `.codeium/windsurf`, `.cursor/`, the desktop app's
+  `claude_desktop_config.json`, or a home-root `AGENTS.md`,
+  `.mcp.json`, `.claude.json`, `.cursorrules`. Assembled paths
+  resolve through simple variable tracking (home variables,
+  agent-target variables, quoted path-parts lists joined later).
+  The write half accepts the usual verbs: open-for-write,
+  `write_text`/`writeFileSync`/`appendFileSync`, `shutil.copy`,
+  redirection, `cp`/`mv`/`tee`/`install`, `sed -i`, handle
+  `.write(...)`, and `claude mcp add`-style CLI registration,
+  which needs no path because it writes the tool's global config
+  by definition. Judgements made, stated plainly:
+  (1) READING a global config is never flagged — only writing
+  it; (2) a skill's own project-local `.claude`/`.codex`/`.mcp`
+  files (no home anchor) never classify, in code or prose;
+  (3) documentation that tells the USER to make the change
+  themselves — paste a snippet, run a named config command — is
+  the same rule at CAUTION: visible and user-mediated, the
+  standing prose discipline, judged per sentence so a warning
+  sentence cannot supply the write verb for a neighbouring
+  storage description, and prohibition frames ("never allow a
+  skill to…") suppress outright; (4) a data file (JSON/TOML/YAML)
+  that merely NAMES a global config path does not fire — a
+  command context is required.
+- **AGENT_CREDENTIAL_READ (BLOCK).** Reads of
+  `~/.claude/.credentials.json`, `~/.codex/auth.json`,
+  `~/.gemini/oauth_creds.json` and OpenCode's `auth.json` under a
+  home anchor — the same tier as SSH_CREDENTIAL_READ, and a
+  member of CREDENTIAL_RULES, so EXFIL_COMBINATION sees it. The
+  value tracker classifies these stores as credential material
+  however the path was assembled (including `os.path.join(home,
+  *parts)` — starred path-parts lists are now expanded as path
+  candidates), so TAINTED_SEND/SECRET_FLOW see the flow too.
+  Writing TO a credential store as the sole destination is not
+  counted as a read. In prose the read is CAUTION, and prose
+  read + prose send to an outside destination composes
+  EXFIL_COMBINATION, like every other credential family.
+  ANY_LANGUAGE_STRUCTURE's private-store anchors gained the two
+  `~/` credential paths (CAUTION, negation-guarded as before).
+- **Fixtures (regression suite: `run_v06_tests.py`).** A
+  24-fixture set was built BEFORE the rules (12 benign, 12
+  attack shapes, including both reports' shapes): all silent
+  code writes BLOCK, the prose bundled-setup shape is CAUTION,
+  prose credential-send BLOCKs via EXFIL_COMBINATION, and the
+  benign set earns **0 BLOCKs** — the only benign fires are the
+  by-design prose CAUTIONs (user-paste instructions, a
+  config-manager's documented command) and pre-existing rules.
+  The two review corpora (benign skills and benign packages)
+  show zero new-rule fires.
+- **Full-corpus re-scan (MaliciousSkillBench, same counting as
+  the v0.5 report).** Benign (n=2,235): false BLOCKs **0**
+  (unchanged), CAUTION 555 → 557 folders, median 34 ms. The new
+  rules fire on exactly 5 benign folders (0.22%), all
+  AGENT_CONFIG_WRITE at CAUTION and all in prose: four are the
+  designed user-mediated shape (an install-scope question naming
+  the global settings file, a "create prompts in
+  ~/.codex/prompts/" instruction, a setup step writing under
+  ~/.claude/, and an uninstall note for a skill whose installer
+  appends a section to the global CLAUDE.md — the CAUTION
+  correctly surfaces that footprint); one is an accepted
+  borderline (an advisory sentence, "pause before persistent
+  edits such as ~/.claude/settings.json"). Only 2 folders change
+  verdict versus v0.5. The first cut fired on 24 benign folders;
+  measurement drove two refinements — prose judged per markdown
+  structure unit with a verb-to-target proximity bar, and the
+  agent skill stores (~/.claude/skills/ and kin) excluded from
+  config targets, because writing there is installing a skill,
+  not rewriting configuration. Malicious (n=7,421, 0 scanner
+  errors): BLOCK 45.7% → **45.8%** (3,395 → 3,398 after the fix
+  wave below) and BLOCK+CAUTION **82.4%** (6,117 → 6,118) — **no
+  verdict got weaker anywhere**; the 3 new BLOCKs are all
+  AGENT_CONFIG_WRITE in code (a write of a config JSON inside
+  ~/.claude/, a write under ~/.claude/MEMORY/ derived through
+  variable hops, and one surfaced by the fix wave's widened path
+  resolution). AGENT_CONFIG_WRITE fires on 37 malicious folders
+  (9 at BLOCK severity, 28 at CAUTION);
+  AGENT_CREDENTIAL_READ fires 0 times — the corpus's credential
+  theft targets SSH/cloud/browser stores, not agent stores, as
+  expected for a corpus that predates the class. Median 101 ms
+  malicious / 36 ms benign after the fix wave (82 / 34 ms at the
+  first cut — the wider matching costs about a fifth more time,
+  still ~0.1 s per folder).
+
+### v0.6 fix pass — three adversarial reviews, one combined pass
+(regression suite: `run_v06fix_tests.py`, 53 checks)
+
+The first cut was reviewed three ways before release — a
+false-positive hunt over 20 plausible-benign fixtures, a 50-case
+evasion red team, and a code audit with performance bombs — and
+shipped only after one combined fix pass closed what they found:
+
+- **Performance (audit).** The matcher's per-line variable work
+  was quadratic twice over (a regex rebuilt per line over the
+  tracked set, and unbounded per-anchor suffix scans): a 500 KB
+  anchor-dense file did not finish in 60 s. Variable mentions are
+  now single identifier scans with set lookups, per-anchor work
+  is bounded, and a statement's own left-hand side is excluded
+  from its here-checks by name rather than by copying the tracked
+  sets (copying them was itself quadratic — found by the fix
+  wave's own timing suite). The audit's bombs now scan in
+  ~3 s / ~0.3 s; a harsher synthetic (11k distinct path
+  variables, 500 KB) scans in ~4.4 s.
+- **False BLOCKs (FP hunt).** 14 of the 20 benign fixtures
+  BLOCKed at the first cut, all via the two new rules. The pass
+  made both rules honest about direction and mediation:
+  AGENT_CREDENTIAL_READ requires a real read — `open` /
+  `read_text` / `cat` / a copy's SOURCE argument / a tar member
+  list; `exists`/`stat`/`isfile` probes and bare path references
+  no longer count, in the line matcher and in the folded-value
+  layer alike (construction is not a read). AGENT_CONFIG_WRITE
+  fires only when the global config is the write DESTINATION —
+  backups and copies OUT of it are not writes. Wrapped
+  (multi-line) path expressions judge like one-liners.
+- **Mediation demotion (the signal, stated precisely).** A code
+  write to a global config demotes BLOCK → CAUTION when the same
+  file structurally gates the write behind the user's decision:
+  an interactive confirmation primitive (`input()`, readline,
+  a prompt/confirm library call, a shell `read -p`) in the
+  write's enclosing function (Python scope analysis) or above it
+  in the same file (other languages), an interactive subcommand
+  dispatch in the file, or an explicit opt-in flag the tool
+  defines (`--apply` / `--write` / `action="store_true"` on an
+  argv-parsing file). Delete-only edits — a config file
+  round-tripped with only deletions (the uninstaller shape:
+  `pop`/`del`/filter-comprehension on the loaded config, no key
+  assignments) — also demote. These signals are structural and
+  therefore fakeable by a determined author; that is accepted at
+  the CAUTION tier, whose meaning is "a human should look", and
+  the demotion never applies to credential reads.
+- **Evasions (red team).** The target rules fired on 4 of 50
+  pre-fix and 42 of 50 after: suffix gate widened (`.go`, `.rs`,
+  `.bat`, `.cmd`, extensionless scripts), anchors widened
+  (`${HOME}`, `os.getenv`, Ruby `ENV[`, PowerShell
+  `$env:USERPROFILE`, `os.userInfo().homedir`, `pwd` `pw_dir`,
+  `Dir.home`, `$XDG_CONFIG_HOME`), paths normalised before
+  matching (`//` collapsed, `./` stripped), shell verbs tolerate
+  a preceding quote (package.json postinstall, `bash -c`, YAML),
+  write verbs added (perl `-pi`, `sed --in-place`, PHP
+  `file_put_contents`, `Deno.writeTextFile`, Ruby `FileUtils.cp`,
+  fs-extra `outputFileSync`), `open()` mode read from the call's
+  real second argument (bare mode variables, nested path calls),
+  folded/split string assembly resolved for config paths as it
+  already was for credentials, same-file function returns and
+  same-folder sibling-module constants resolved, `setup.py`
+  blanking narrowed to true docstrings (a literal-path write in
+  setup.py is code again), SKILL.md fenced shell judged as code
+  (at CAUTION, the prose tier), `~/.aider.conf.yml` recognised,
+  `__file__` parent chains to a config-named file CAUTION, and
+  Spanish write-verbs added to the prose matcher. Correctness
+  fixes from the audit ride along: a bare `>` is not a write
+  (comparisons, shifts, annotations excluded; redirection needs
+  a shell-ish shape), stale bindings die on reassignment,
+  credential matches must share the anchor's own path
+  expression, `claude mcp add` in a data file needs command
+  context, prohibition framing is sentence-scoped, prose
+  proximity is measured verb-to-TARGET with a paragraph fallback,
+  and the any-language structure guard honours the top
+  phrase-file languages' negations.
+- **Post-fix review corpora.** FP fixtures: 0 BLOCKs except the
+  five argued below. Red team: 42/50 fire at tier. Audit
+  fixtures t1–t12 all meet their expectations. Full-corpus
+  re-scan: benign false BLOCKs still **0**, malicious **no
+  verdict weaker** than the first cut anywhere, BLOCK 3,398.
+- **Accepted by design (not chased).** (a) A runnable example
+  that writes a global config silently when run BLOCKs even
+  inside a docs folder (FP 05) — running it IS the write, and it
+  carries no mediation signal; (b) a silent, unmediated wholesale
+  copy or tar archive of the agent credential stores BLOCKs as a
+  read (FP 08/13) — that shape is the exfil precursor, and
+  mediation would demote it if it existed; (c) quoted attack
+  samples in security-teaching material may BLOCK (FP F6) — the
+  scanner cannot distinguish a labelled sample from a payload,
+  and the sample folders carry no inert-marker convention;
+  (d) unmediated appends into the agent's MEMORY tree stay BLOCK
+  (FP F7) — memory writes are the poisoning surface itself;
+  (e) `$(echo claude)`-style command substitution, symlink
+  indirection, globbed credential paths, destinations computed
+  from data-file contents (beyond same-folder literals), and
+  byte-assembled paths with no literal path text (rt19/27/30/32/
+  37/44/47/50) — each needs either execution, a filesystem, or
+  semantic inference this scanner deliberately does not do; the
+  affected folders still land at CAUTION or BLOCK via generic
+  rules in most cases (rt19/32/47 do).
+
+### v0.6 fix wave 2 — round-2 reviews, one combined pass
+(regression suite: `run_v06fix2_tests.py`, 41 checks)
+
+The shipped fix pass was itself reviewed three ways — a second
+red team (37 fixtures), a second false-positive hunt (20 fixtures
++ probes), and a second code audit — and a second combined pass
+closed what they found before release:
+
+- **Mediation, hardened (the signal, restated precisely).** A
+  demotion signal counts only in real code: comments and string
+  contents are blanked before signal matching, so a prompt that
+  exists only in a comment or a help string demotes nothing. A
+  helper-defined confirmation primitive demotes a file-scope
+  write only when the helper is actually CALLED. A shell
+  `read -p` demotes only when it can actually stop the write —
+  the write sits in the branch the prompt controls, or the
+  prompt shares the write's region unconditionally before it; a
+  prompt stranded in a dead branch demotes nothing. Delete-only
+  demotion is disqualified by any key-addition shape in the
+  round-trip: `.update({...})` with literal keys, a dict merge
+  (`{**cfg, "k": v}`), or a subscript assignment all count as
+  writes, however many `pop`s surround them. Mediation never
+  applies to credential reads — unchanged.
+- **Flag gates: shape, polarity, no tautologies.** Any
+  `store_true`-style opt-in flag counts (no name whitelist),
+  but only when it can actually keep the write from running by
+  default: the write must sit in the branch of a condition that
+  references the flag positively (`if args.apply:`), or follow
+  an early-exit guard that references it negated (`if not
+  args.commit: … return`). A condition with a constant-true
+  disjunct (`if args.apply or True:`) guards nothing, and an
+  opt-OUT flag's positive guard (`if args.dry_run: return` —
+  the write runs whenever the flag is absent) guards nothing
+  either: polarity, not the flag's name, decides.
+- **Folder-aware mediation.** The gating primitive may live in
+  another file of the same folder neighbourhood (the file's
+  folder, its parent folder, and this folder's sub-folders)
+  when that file references the writing file — by module
+  import, a call through the module, or the file's basename
+  (the subprocess / script-delegation shape). An unreferenced
+  neighbour's prompt demotes nothing.
+- **Recognition widened.** Primitives add the JS `prompts`
+  package, `tkinter.messagebox.askyesno` / Qt question dialogs,
+  and Ruby `$stdin.gets` / `STDIN.gets`. Shell dispatch
+  normalises `${1:-}` / `${1}` to `$1`, and shell FUNCTION
+  BODIES are scanned by the config-write matcher (a
+  function-wrapped `cp` is judged, and demoted when a
+  condition-invoked confirm function gates the call).
+  Credential tracking follows lists/tuples of pre-joined path
+  expressions: iterating or copying their elements is
+  credential access, and looping over a NAMED credential-path
+  list binds the loop variable the same way the literal form
+  always did.
+- **Decision (no code): env-var and config-file opt-ins are
+  NOT mediation signals.** An environment variable or a config
+  setting that enables a write does not guarantee a human in
+  the loop — an agent invoking the tool inherits both — so a
+  write gated only by `os.environ` or a settings file stays
+  BLOCK. (FP round-2 fixtures 03/04 pin this outcome.)
+- **Resolver and verb gaps.** `..` and `.` segments are
+  resolved textually during normalisation (bounded, no
+  filesystem access), which closes the skills-store exclusion
+  bypass and the through-`..` credential shape. Function
+  default-argument path expressions are tracked as parameter
+  assignments in that function's scope. Write verbs add
+  `dd of=<target>`, tar extraction with `-C`/`--directory`,
+  and `unzip -o` with `-d` into a config directory — and a
+  non-config redirect on the same line (`2>/dev/null`) no
+  longer hides them. Credential reads add batch `type`/`more`
+  (`.bat`/`.cmd`), JS `fs.createReadStream`, and one-level
+  helper argument flow (a same-file function that reads its
+  parameter, called with a credential/config path, fires at
+  the call site). A write to a tilde-user anchor
+  (`~name/.claude/...`) fires AGENT_CONFIG_WRITE at CAUTION
+  minimum — another user's config is still a global config,
+  but the current user's own agent may not read it back, so
+  it is not promoted to BLOCK on shape alone. Quoted-string
+  path assembly now also tries sub-chains starting at later
+  components, so unrelated strings quoted earlier in the same
+  statement (a prompt library's options object) cannot poison
+  the chain.
+- **Audit round 2 (performance + one correctness bug).** Two
+  new superlinear patterns in the fix-pass code are closed:
+  the agent-function call matcher is a token intersection, not
+  one regex per function (1,000 path-helper functions:
+  57.6 s → ~1.2 s), and every file-scoped demotion signal is
+  computed once per file instead of per firing write (3,000
+  firing writes: ~100 s class → ~2 s). A stale-variable bug —
+  the credential-list check reading the PREVIOUS statement's
+  token set — is fixed in both directions (a false BLOCK on an
+  unrelated read, and a missed credential read). The timing
+  section now pins FOUR shapes (the two round-1 bombs plus
+  these two), each < 5 s, so the class cannot return a third
+  time unnoticed. One correction of record: the fix pass's
+  B+C figure was misstated in its report — B+C was
+  6,117 → 6,117; the change was BLOCK 3,397 → 3,398, with the
+  single folder moving CAUTION → BLOCK within B+C.
+- **Post-wave corpora.** Red team round 2: every forgery stays
+  BLOCK and every resolver/verb gap fires; the one remaining
+  miss is a path plumbed through the module `__doc__`
+  (accepted, LOW — deliberate, exotic). FP round 2: the
+  widened legitimate shapes demote; fixtures 03/04 stay BLOCK
+  per the env/config decision above. Round-1 corpora
+  unchanged: red team 42/50 at tier, FP fixtures at their
+  designed tiers, legacy benign corpora byte-identical to
+  v0.5 (29 targets, 0 differ). Full-corpus re-scan: benign
+  false BLOCKs still **0**; malicious BLOCK and B+C at or
+  above the fix-pass figures with **zero weaker verdicts**
+  (exact figures in docs/BENCHMARKS.md).
+
 ---
 
 *Map compiled from the four audits above and the scanner source
 (`skillscan/rules.py`, `skillscan/scanner.py`) and test suites as of
-v0.5.0. If a rule or a sample changes, this map must change with it — a
+v0.6.0. If a rule or a sample changes, this map must change with it — a
 coverage claim without a suite behind it is exactly the kind of thing
 this document exists to prevent.*

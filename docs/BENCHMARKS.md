@@ -3,7 +3,7 @@
 SkillScan's measured detection and false-positive rates on a public
 labelled corpus. These are SkillScan's own numbers, published as
 measured — including the families where the rates are poor. Last run:
-**2026-11-10**, scanner **SkillScan v0.5.0** (57 deterministic rules).
+**2026-11-11**, scanner **SkillScan v0.6.0** (59 deterministic rules).
 
 ## Corpus
 
@@ -39,7 +39,7 @@ subset of the malicious side.
 - SkillScan interacted with every sample by reading it as text only.
   Nothing was executed, installed, imported, or uploaded. The scanner
   produced zero errors across all 9,656 scans.
-- Median scan time was ~80 ms per malicious skill and ~43 ms per
+- Median scan time was ~82 ms per malicious skill and ~34 ms per
   benign skill.
 
 ## Counting rules
@@ -61,22 +61,36 @@ subset of the malicious side.
 
 | Set | n | BLOCK | CAUTION | PASS | Detection (BLOCK) | Detection (BLOCK+CAUTION) |
 |---|---|---|---|---|---|---|
-| Malicious | 7,421 | 3,395 | 2,722 | 1,304 | **45.7%** | **82.4%** |
-| Benign | 2,235 | 0 | 555 | 1,680 | false BLOCK **0%** | flagged 24.8% |
+| Malicious | 7,421 | 3,399 | 2,718 | 1,304 | **45.8%** | **82.4%** |
+| Benign | 2,235 | 0 | 557 | 1,678 | false BLOCK **0%** | flagged 24.9% |
 
-What changed from v0.4, stated exactly: BLOCK detection is identical
-in every labelled attack family below; across the whole malicious
-set, one previously-CAUTION uncategorised skill moved to BLOCK and
-47 previously-PASS skills moved to CAUTION, and no skill's verdict
-got weaker. The v0.5 gain is breadth at CAUTION (new prose-chain,
-output-manipulation and value-flow rules), not strict detection.
+What changed from v0.5, stated exactly: four previously-CAUTION
+malicious skills moved to BLOCK — all caught by the new
+AGENT_CONFIG_WRITE rule in code (a write of a config file inside
+`~/.claude/`, a write under `~/.claude/MEMORY/` assembled
+through variables, a third surfaced by the v0.6 fix wave's
+widened path resolution, and a fourth — a Ruby `File.write` to
+a `File.join(Dir.home, '.claude', …)` token path — surfaced by
+fix wave 2) — and no skill's verdict got weaker
+anywhere, in the build, the fix wave, or fix wave 2. The v0.6 rules target
+a 2026 attack class (agent-config poisoning) that this corpus
+largely predates: AGENT_CONFIG_WRITE fires on 38 malicious
+folders (9 at BLOCK severity, 29 at CAUTION) and
+AGENT_CREDENTIAL_READ on none, because the corpus's credential
+theft aims at SSH/cloud/browser stores, not agent credential
+stores. On the benign side the new rules fire
+on 5 folders (0.22%), all AGENT_CONFIG_WRITE at CAUTION in prose
+— four are genuine user-mediated global-config instructions (the
+shape the CAUTION tier exists for) and one is an accepted
+borderline advisory sentence; 2 benign folders change verdict
+(both PASS → CAUTION).
 
 ### Detection by attack family (membership basis)
 
 | Family | n | BLOCK | BLOCK+CAUTION |
 |---|---|---|---|
-| privilege_tool_authority_abuse | 1,004 | 74.4% | 99.4% |
-| execution_code_delivery | 3,205 | 74.1% | 97.9% |
+| privilege_tool_authority_abuse | 1,004 | 74.5% | 99.4% |
+| execution_code_delivery | 3,205 | 74.2% | 97.9% |
 | credential_access | 197 | 55.3% | 95.9% |
 | persistence_control | 249 | 55.0% | 90.0% |
 | instruction_goal_memory_manipulation | 1,560 | 63.9% | 86.2% |
@@ -106,13 +120,12 @@ Two membership figures need their honest footnotes:
   string literals, documentation examples) below block severity,
   the regression was fully reversed on the same benign set, and
   v0.5 holds at zero.
-- CAUTIONs: 555 (24.8%), up from 498 (22.3%) in v0.4. The increase
-  is the new v0.5 coverage firing at caution severity on benign
-  prose: `PROSE_READ_SEND` (60 skills), `PROSE_INSTRUCTION_EN` (27),
-  `PROSE_FETCH_EXECUTE` (16), `PROSE_PIPE_INSTRUCTION` (15) and
-  `OUTPUT_MANIPULATION` (4). The top driver overall remains
-  `PROSE_DOWNLOAD_RUN` (290 skills, 13.0% of all benign): prose
-  that joins an external download with a run step.
+- CAUTIONs: 557 (24.9%), up from 555 (24.8%) in v0.5. The v0.6
+  addition is `AGENT_CONFIG_WRITE` on 5 skills (0.22%), all in
+  prose at caution severity (see the headline note). The top
+  driver overall remains `PROSE_DOWNLOAD_RUN` (290 skills, 13.0%
+  of all benign): prose that joins an external download with a
+  run step.
 
 ## Limitations
 

@@ -29,5 +29,22 @@
     "sin decirle al usuario",
     "oculta esto al usuario",
     "no le cuentes al usuario"
+  ],
+  "config_write": [
+    "añade",
+    "agrega",
+    "escribe",
+    "copia",
+    "pega",
+    "guarda",
+    "inserta",
+    "edita",
+    "modifica",
+    "reemplaza",
+    "crea",
+    "registra",
+    "instala",
+    "coloca",
+    "incluye"
   ]
 }

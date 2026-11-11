@@ -128,7 +128,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full guide:
 
 ## Rules
 
-57 deterministic rules. Any block-severity hit makes the verdict BLOCK;
+59 deterministic rules. Any block-severity hit makes the verdict BLOCK;
 otherwise any caution hit makes it CAUTION; otherwise PASS. Every rule
 also carries an OWASP mapping (LLM Top 10 / MCP Top 10 category codes),
 surfaced per finding in JSON output and in SARIF rule metadata — it is
@@ -137,6 +137,8 @@ triage metadata only and never affects the verdict.
 | Rule | Severity | What it catches |
 |------|----------|-----------------|
 | SSH_CREDENTIAL_READ | block | Reads `~/.ssh`, `id_rsa`, `id_ed25519`, other private-key files |
+| AGENT_CREDENTIAL_READ | block | Reads an AI agent's own credential store (`~/.claude/.credentials.json`, `~/.codex/auth.json`, Gemini/OpenCode auth files). Counts as credential material for EXFIL_COMBINATION and value tracking, like an SSH key |
+| AGENT_CONFIG_WRITE | block | Code that writes, appends, copies or registers into a GLOBAL agent configuration — `~/.claude/CLAUDE.md`, global settings or SessionStart hooks, `~/.codex` config, a desktop app's MCP config (`claude mcp add` included), global editor/agent rules. Documentation telling the user to make the same change themselves is the same rule at caution; a skill's own project-local `.claude`/`.codex`/`.mcp` files never count |
 | CLOUD_CREDENTIAL_READ | block | Reads `~/.aws`, `~/.azure`, `~/.gcloud` credential material |
 | ENV_FILE_READ | block | Reads a `.env` file / loads dotenv (JS `process.env` is *not* this rule) |
 | ENVIRON_SECRET_ACCESS | caution | Accesses `os.environ` / `getenv(...)` / `process.env` |
@@ -305,13 +307,16 @@ python3 run_v04_tests.py       # v0.4: dependency sources (off-registry manifest
 python3 run_v04fix_tests.py    # v0.4 fix pass: scanner-DoS perf shapes, inert-text (comment/string) precision, routine-lifecycle + same-package combination scoping, urllib.parse classification, and one regression case per adversarial-review evasion (fixtures are inert and built in a temp dir)
 python3 run_v05_tests.py       # v0.5: prose fetch-execute / pipe / read-send chains + safety-bypass lure, output-manipulation + prompt-manipulation phrases on instruction surfaces, taint-lite (credential flow to sends), offline typosquat + its harvested-name validation gate (fixtures are inert and built in a temp dir)
 python3 run_v05fix_tests.py    # v0.5 fix pass: scope-aware flow-sensitive taint (no BLOCK on a name collision), lure proximity + framing suppression, guard-laundering closures, output-manipulation frame scoping, typosquat manifest extraction (bare names, setup.py, homoglyphs), one regression case per adversarial-review finding (fixtures are inert and built in a temp dir)
+python3 run_v06_tests.py       # v0.6: agent-config poisoning — silent writes/registrations into global agent configs BLOCK, agent credential-store reads BLOCK and flow into the exfil combinations, user-mediated prose at CAUTION, own-folder/project-local configs never flagged (fixtures are inert and built in a temp dir)
+python3 run_v06fix_tests.py    # v0.6 fix pass: mediation demotion (prompt/flag-gated config writes at CAUTION), real-read discipline (exists/stat probes never count), direction-aware writes, stale-binding kills, red-team evasion closures, matcher timing bombs (fixtures are inert and built in a temp dir)
+python3 run_v06fix2_tests.py   # v0.6 fix wave 2: demotion hardening (code-only signals, called helpers, guarding shell prompts, delete-only disqualifiers, flag polarity/tautology), folder-aware mediation, widened primitives (JS prompts, GUI dialogs, Ruby gets), ../. resolution, dd/tar/unzip + batch/helper credential reads, tilde-user writes, audit-2 perf shapes + stale-token fix, four timed bomb shapes (fixtures are inert and built in a temp dir)
 ```
 
 ## Coverage against published audits
 
 [`docs/AUDIT_COVERAGE.md`](docs/AUDIT_COVERAGE.md) maps 25 techniques
 from four published audits of real malicious skills / MCP servers
-against the 57 rules above. Summary (Covered / Partial / Gap per audit):
+against the 59 rules above. Summary (Covered / Partial / Gap per audit):
 
 | Audit | Covered | Partial | Gap |
 |-------|---------|---------|-----|
@@ -336,7 +341,7 @@ codes, and exits non-zero on any failure.
 
 SkillScan's own measured rates on a public labelled corpus —
 **MaliciousSkillBench** (9,740 labelled skills, pinned at commit
-`893afd6`), run 2026-11-10 with SkillScan **v0.5.0**. Malicious skills
+`893afd6`), run 2026-11-11 with SkillScan **v0.6.0**. Malicious skills
 were scanned as complete extracted folders; benign skills are shipped
 by the benchmark as frozen text, so each was scanned as a single
 `SKILL.md` folder. Nothing was executed — folders were read as text
@@ -345,19 +350,19 @@ only. Full methodology, counting rules and caveats:
 
 | Set | Skills | BLOCK | CAUTION | PASS |
 |-----|--------|-------|---------|------|
-| Malicious | 7,421 | **45.7%** (3,395) | 36.7% (2,722) | 17.6% (1,304) |
-| Benign | 2,235 | 0% false BLOCKs (0) | 24.8% (555) | 75.2% (1,680) |
+| Malicious | 7,421 | **45.8%** (3,399) | 36.6% (2,718) | 17.6% (1,304) |
+| Benign | 2,235 | 0% false BLOCKs (0) | 24.9% (557) | 75.1% (1,678) |
 
 Detection at BLOCK+CAUTION (flagged at any severity): **82.4%** of
-malicious skills; 24.8% of benign skills were flagged at any severity.
+malicious skills; 24.9% of benign skills were flagged at any severity.
 
 Detection by attack family (multi-label membership; BLOCK /
 BLOCK+CAUTION):
 
 | Family | Skills | BLOCK | BLOCK+CAUTION |
 |--------|--------|-------|---------------|
-| Privilege / tool-authority abuse | 1,004 | 74.4% | 99.4% |
-| Execution / code delivery | 3,205 | 74.1% | 97.9% |
+| Privilege / tool-authority abuse | 1,004 | 74.5% | 99.4% |
+| Execution / code delivery | 3,205 | 74.2% | 97.9% |
 | Credential access | 197 | 55.3% | 95.9% |
 | Persistence / control | 249 | 55.0% | 90.0% |
 | Instruction / goal manipulation | 1,560 | 63.9% | 86.2% |

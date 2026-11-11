@@ -75,10 +75,10 @@ def main() -> int:
 
     sys.path.insert(0, str(ROOT))
     import skillscan
-    check("version-is-0.5.0", skillscan.__version__ == "0.5.0",
+    check("version-is-0.6.0", skillscan.__version__ == "0.6.0",
           skillscan.__version__)
     from skillscan.rules import RULES
-    check("rule-count-57", len(RULES) == 57, f"{len(RULES)} rules")
+    check("rule-count-59", len(RULES) == 59, f"{len(RULES)} rules")
 
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)

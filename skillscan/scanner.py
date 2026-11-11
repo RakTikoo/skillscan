@@ -63,7 +63,8 @@ TEXTLIKE_EXTENSIONS = {
 VERDICT_EXIT_CODES = {"PASS": 0, "CAUTION": 1, "BLOCK": 2}
 
 CREDENTIAL_RULES = {
-    "SSH_CREDENTIAL_READ", "CLOUD_CREDENTIAL_READ", "ENV_FILE_READ",
+    "SSH_CREDENTIAL_READ", "AGENT_CREDENTIAL_READ",
+    "CLOUD_CREDENTIAL_READ", "ENV_FILE_READ",
     # A browser/wallet credential store counts as credential material for
     # the EXFIL_COMBINATION rule: store access + a send channel is the
     # stealer shape.
@@ -486,7 +487,8 @@ _BROWSER_STORE_FRAGMENTS = (
 )
 
 
-def _check_credential_value(value: str, rel: str, line: int, add) -> None:
+def _check_credential_value(value: str, rel: str, line: int, add,
+                            agent_read: bool = False) -> None:
     if ".ssh" in value or "id_rsa" in value or "id_ed25519" in value \
             or "id_ecdsa" in value or "id_dsa" in value:
         add("SSH_CREDENTIAL_READ", rel, line)
@@ -497,6 +499,306 @@ def _check_credential_value(value: str, rel: str, line: int, add) -> None:
         add("ENV_FILE_READ", rel, line)
     if any(fragment in value for fragment in _BROWSER_STORE_FRAGMENTS):
         add("BROWSER_CREDENTIAL_STORE", rel, line)
+    # Agent credential stores (v0.6) fire only in a genuine READ
+    # context (agent_read): a folded value that merely CONSTRUCTS
+    # or references the path — an assignment, a Path(...) join, an
+    # exists() probe — is not a read (v0.6 fix wave, FP-hunt F1).
+    # Reader contexts: open(...) arguments, a copy call's SOURCE
+    # argument, subprocess command strings. The line matcher
+    # carries the same discipline.
+    if agent_read and _is_agent_credential_value(value):
+        add("AGENT_CREDENTIAL_READ", rel, line)
+
+
+# --- v0.6: AI-agent credential stores & global agent configuration ------
+# The agent-poisoning shapes from the 2026 audit reports: a skill that
+# reads the agent's OWN sign-in files, or quietly rewrites the agent's
+# GLOBAL configuration so every future session inherits attacker
+# instructions. Both rules hinge on GLOBAL vs the skill's own folder:
+# a project-local .claude/settings.json or .mcp.json shipped inside a
+# skill is ordinary, and must never classify — every matcher below
+# therefore requires a home anchor (~/$HOME/%USERPROFILE%/Path.home()/
+# expanduser/homedir/an absolute home path, or a variable built from
+# one) before an agent location counts as global.
+
+_AGENT_CRED_PATH_RE = re.compile(
+    r"(?:^|/)(?:\.claude/\.credentials\.json|\.codex/auth\.json|"
+    r"\.gemini/oauth_creds\.json|opencode/auth\.json)\b")
+
+_AGENT_HOME_ANCHOR_RE = re.compile(
+    r"(?:~|\$home\b|\$\{\s*home\s*\}|%userprofile%|"
+    r"\$env:(?:userprofile|home)\b|path\.home\s*\(|expanduser\s*\(|"
+    r"os\.homedir\s*\(|homedir\s*\(|process\.env\.home\b|"
+    r"os\.environ\s*\[\s*['\"]?home|environ\.get\s*\(\s*['\"]home|"
+    r"os\.getenv\s*\(\s*['\"]?home|getenv\s*\(\s*['\"]?home|"
+    r"env\.get\s*\(\s*['\"]?home|env\[\s*['\"]?home|"
+    r"userinfo\s*\(|userhomedir\s*\(|home_dir\s*\(|pw_dir\b|"
+    r"dir\.home\b|"
+    r"xdg_config_home|"
+    r"/home/[^/\s'\"]+|/users/[^/\s'\"]+|[a-z]:/users/[^/\s'\"]+)")
+
+# Agent-config locations, matched at the START of the path remainder
+# after a home anchor (a project folder under $HOME must not classify:
+# $HOME/work/repo/.claude/settings.json is that repo's own config).
+_AGENT_CONFIG_SEGMENT_RES = [
+    re.compile(r"\.claude(?:/|$)"),
+    re.compile(r"\.codex(?:/|$)"),
+    re.compile(r"\.gemini(?:/|$)"),
+    re.compile(r"\.config/(?:claude|codex|opencode|gemini|cursor|"
+               r"windsurf)(?:/|$)"),
+    re.compile(r"\.codeium/windsurf(?:/|$)"),
+    re.compile(r"\.cursor(?:/|$)"),
+    re.compile(r"library/application\s?support/claude/"
+               r"claude_desktop_config\.json$"),
+    re.compile(r"appdata/(?:roaming|local)/claude/"
+               r"claude_desktop_config\.json$"),
+]
+_AGENT_CONFIG_EXACT_REMAINDERS = {"/agents.md", "/.mcp.json",
+                                  "/.claude.json", "/.cursorrules",
+                                  "/.aider.conf.yml"}
+
+
+def _normalize_path_text(s: str) -> str:
+    """Path-shape normalisation shared by every agent matcher:
+    duplicate slashes collapse, `/./` segments vanish, and `..`
+    segments are resolved TEXTUALLY (bounded stack pass, no
+    filesystem access), so `~//.claude//x`, `~/./.claude/x` and
+    `~/.claude/skills/mine/../../CLAUDE.md` judge exactly like
+    the paths they resolve to (red-team rt31/rt33/rt45; fix
+    wave 2 G1 — the unresolved `..` form inherited the skill
+    store's exclusion while landing on the global config)."""
+    s = re.sub(r"/{2,}", "/", s)
+    while "/./" in s:
+        s = s.replace("/./", "/")
+    if "/../" in s or s.endswith("/.."):
+        parts = s.split("/")
+        stack: list[str] = []
+        for part in parts:
+            if part == "..":
+                if stack and stack[-1] not in ("", "..", "~"):
+                    stack.pop()
+                elif not stack or stack[-1] == "":
+                    continue  # cannot ascend past the root
+                else:
+                    stack.append(part)
+            elif part == ".":
+                continue
+            else:
+                stack.append(part)
+        s = "/".join(stack)
+        s = re.sub(r"/{2,}", "/", s)
+    return s
+
+
+def _agent_compact(text: str) -> str:
+    """Quote/space/comma-insensitive form for path matching, so
+    Path.home() / '.claude' / 'CLAUDE.md', path.join(home, '.claude'),
+    and '~/.claude/CLAUDE.md' all compare the same way."""
+    s = text.replace("\\", "/").lower()
+    s = re.sub(r"[\s'\"`]+", "", s)
+    s = s.replace(",", "/")
+    return _normalize_path_text(s)
+
+
+def _agent_remainder_after_anchor(compact: str, pos: int) -> str:
+    rest = compact[pos:pos + 300]
+    rest = re.sub(r"^[)/{}]+", "", rest)
+    rest = re.sub(r"^\.?joinpath\(", "/", rest)
+    rest = re.sub(r"^[)/{}]+", "", rest)
+    if not rest.startswith("/"):
+        rest = "/" + rest
+    # Stripping a call's closing paren can leave a concat artifact
+    # (`getenv(home) . '/.claude/...'` -> `/./.claude/...`): judge
+    # the normalised remainder, like every other path form.
+    return _normalize_path_text(rest)
+
+
+_AGENT_SKILL_STORE_RE = re.compile(
+    r"^(?:\.(?:claude|codex|gemini|cursor)/skills(?:/|$)"
+    r"|\.config/[\w-]+/skills(?:/|$)"
+    r"|\.codeium/windsurf/skills(?:/|$))")
+
+
+def _agent_segment_match(remainder: str) -> bool:
+    remainder = _normalize_path_text(remainder)
+    body = remainder.lstrip("/")
+    if _AGENT_SKILL_STORE_RE.match(body):
+        # The agent's skill STORE (~/.claude/skills/ and kin) is
+        # where skills themselves live; writing there is installing
+        # a skill — which the pre-install scan then judges on its
+        # own content — not rewriting the agent's configuration.
+        return False
+    for exact in _AGENT_CONFIG_EXACT_REMAINDERS:
+        if remainder == exact or (
+                remainder.startswith(exact)
+                and remainder[len(exact):len(exact) + 1]
+                not in ("abcdefghijklmnopqrstuvwxyz0123456789_.-/")):
+            # The named home-root file itself, at the end of the
+            # remainder or followed by a non-path character
+            # (`open('~/.aider.conf.yml', 'w')` — rt41) — but not a
+            # longer name that merely shares the prefix.
+            return True
+    if "claude_desktop_config.json" in body and (
+            body.startswith("library/application")
+            or body.startswith("appdata/")):
+        return True
+    return any(p.match(body) for p in _AGENT_CONFIG_SEGMENT_RES)
+
+
+def _quoted_components(text: str) -> list[str]:
+    return re.findall(r"['\"`]([^'\"`]+)['\"`]", text)
+
+
+def _comps_candidates(text: str) -> list[str]:
+    """Path chains assembled from a statement's quoted strings:
+    the full chain, plus every sub-chain starting at a later
+    component. A statement can quote unrelated strings before
+    the path it builds (a prompts({message: "Install?"}) options
+    object fused into the same logical statement as the write —
+    fix wave 2); the full chain then starts with junk segments
+    and the real path never gets its chance. Sub-chains are
+    still anchor-gated by the callers, and each is tested with
+    the same segment matcher, so this only gives the path the
+    statement actually assembles its hearing."""
+    comps = [c.replace("\\", "/").strip("/")
+             for c in _quoted_components(text)]
+    comps = [c for c in comps if c]
+    if not comps:
+        return []
+    return ["/".join(comps[i:]) for i in range(len(comps))]
+
+
+def _is_agent_credential_value(value: str) -> bool:
+    """True when a single folded string value IS a global agent
+    credential path: home-anchored (or absolute under a home dir) and
+    naming a known agent credential store. A bare relative
+    '.claude/.credentials.json' — a sample inside the skill's own
+    folder — deliberately does not classify, and neither does a
+    non-home absolute path such as /srv/fixtures/.codex/auth.json
+    (audit F9): an anchor must be a HOME anchor."""
+    low = _normalize_path_text(value.replace("\\", "/").lower())
+    if not _AGENT_CRED_PATH_RE.search(low):
+        return False
+    if low.startswith(("~", "$home", "${home}", "%userprofile%")):
+        return True
+    return bool(_AGENT_HOME_ANCHOR_RE.search(low))
+
+
+# --- v0.6 fix wave: token-based variable mentions -------------------------
+# The pre-fix matcher rebuilt a regex alternation over the tracked
+# variable sets for every line — O(vars) compile work per line and
+# O(vars^2) per file on anchor-dense input (audit F1). Variable
+# mentions are now found with ONE identifier scan plus set lookups:
+# O(line) per line, no per-line compilation.
+
+_AGENT_TOKEN_RE = re.compile(r"[A-Za-z_$][\w$-]*")
+
+
+def _var_positions(text: str, names,
+                   exclude: str | None = None) -> list[int]:
+    """End offsets of identifier tokens in `text` that are members
+    of `names` — the position a path remainder is measured from."""
+    if not names:
+        return []
+    return [m.end() for m in _AGENT_TOKEN_RE.finditer(text)
+            if m.group() in names and m.group() != exclude]
+
+
+def _tokens_present(text: str, names) -> bool:
+    if not names:
+        return False
+    return any(m.group() in names for m in _AGENT_TOKEN_RE.finditer(text))
+
+
+# The gap allowed between a home anchor and the credential path it
+# anchors (audit F5): only path-expression punctuation — quotes,
+# slashes, commas, brackets, a `~`, a `+`. A `;`, a command word or
+# any other letter means the anchor and the path belong to different
+# expressions that merely share a line (`cd ~; cat sample/...`).
+_AGENT_PATH_GAP_RE = re.compile(r"^[\s/'\",+()\[\]~]*$")
+
+
+def _anchored_search(pattern: re.Pattern, text: str,
+                     anchor_ends: list[int]) -> bool:
+    """True when `pattern` matches shortly after one of the anchor
+    end positions, with nothing but path punctuation in between.
+    Each anchor inspects a bounded 300-char window (audit F2)."""
+    for pos in anchor_ends[:64]:
+        window = text[pos:pos + 300]
+        m = pattern.search(window)
+        if m and _AGENT_PATH_GAP_RE.match(window[:m.start()]):
+            return True
+    return False
+
+
+def _comps_join(text: str) -> str:
+    return "/".join(c.replace("\\", "/").strip("/")
+                    for c in _quoted_components(text))
+
+
+def _agent_target_in_text(text: str, home_vars=frozenset(),
+                          part_vars: dict | None = None,
+                          config_vars=frozenset(),
+                          exclude: str | None = None) -> bool:
+    compact = _agent_compact(text)
+    anchors: list[tuple[int, bool]] = []
+    for m in _AGENT_HOME_ANCHOR_RE.finditer(compact):
+        anchors.append((m.end(), "xdg_config_home" in m.group()))
+    if home_vars:
+        for m in _AGENT_TOKEN_RE.finditer(compact):
+            if m.group() in home_vars and m.group() != exclude:
+                anchors.append((m.end(), m.group() in config_vars))
+    if not anchors:
+        return False
+    for cand in _comps_candidates(text):
+        if _agent_segment_match("/" + cand.lower()):
+            return True
+        if any(cfg for _e, cfg in anchors) and _agent_segment_match(
+                "/.config/" + cand.lower()):
+            return True
+    if part_vars:
+        # Token intersection, NOT one regex per tracked name: the
+        # per-name search was quadratic on files that build many
+        # path variables (audit F1's second coming — an 11k-variable
+        # anchor-dense file hung the fix suite itself).
+        toks = {m.group() for m in _AGENT_TOKEN_RE.finditer(text)}
+        toks.discard(exclude)
+        for name in toks & part_vars.keys():
+            if _agent_segment_match("/" + part_vars[name]):
+                return True
+    for pos, cfg_rooted in anchors[:64]:
+        rem = _agent_remainder_after_anchor(compact, pos)
+        if _agent_segment_match(rem):
+            return True
+        if cfg_rooted and _agent_segment_match("/.config" + rem):
+            return True
+    return False
+
+
+def _agent_credential_in_text(text: str, home_vars=frozenset(),
+                              part_vars: dict | None = None,
+                              exclude: str | None = None) -> bool:
+    plain = _normalize_path_text(text.replace("\\", "/").lower())
+    ends = [m.end() for m in _AGENT_HOME_ANCHOR_RE.finditer(plain)]
+    if ends and _anchored_search(_AGENT_CRED_PATH_RE, plain, ends):
+        return True  # spaced form: word boundaries intact
+    compact = _agent_compact(text)
+    ends = [m.end() for m in _AGENT_HOME_ANCHOR_RE.finditer(compact)]
+    ends += _var_positions(compact, home_vars, exclude)
+    if not ends:
+        return False
+    if _anchored_search(_AGENT_CRED_PATH_RE, compact, ends):
+        return True
+    for cand in _comps_candidates(text):
+        if _AGENT_CRED_PATH_RE.search("/" + cand.lower()):
+            return True
+    if part_vars:
+        toks = {m.group() for m in _AGENT_TOKEN_RE.finditer(text)}
+        toks.discard(exclude)
+        for name in toks & part_vars.keys():
+            if _AGENT_CRED_PATH_RE.search("/" + part_vars[name]):
+                return True
+    return False
 
 
 def _is_metadata_text(text: str) -> bool:
@@ -551,6 +853,16 @@ def _classify_path_value(value: str) -> str | None:
         # A public key is meant to be shared; it is not credential
         # material even inside ~/.ssh (FP hunt: pubkey registrar).
         return None
+    if _is_agent_credential_value(value) or any(
+            low.endswith(sfx) for sfx in (
+                ".claude/.credentials.json", ".codex/auth.json",
+                ".gemini/oauth_creds.json", "opencode/auth.json")):
+        # Taint-layer classification only (this helper feeds nothing
+        # else): an agent credential store is credential material
+        # however the path was assembled, exactly like an SSH
+        # identity suffix. The BLOCK-tier AGENT_CREDENTIAL_READ
+        # line rule keeps its stricter home-anchor discipline.
+        return "cred"
     if ".ssh" in low or ".aws" in low or ".azure" in low \
             or ".gcloud" in low:
         return "cred"
@@ -594,6 +906,16 @@ def _path_candidates(node: ast.AST, sym: _Symbols) -> list[str]:
                 else None
             if lst and isinstance(idx, int) and 0 <= idx < len(lst):
                 out.append(str(lst[idx]))
+        elif isinstance(sub, ast.Starred) \
+                and isinstance(sub.value, ast.Name):
+            # os.path.join(home, *parts): the starred list's pieces
+            # are path components — offer them singly and joined.
+            lst = sym.env_list.get(sub.value.id)
+            if lst:
+                pieces = [str(x) for x in lst]
+                out.extend(pieces)
+                if len(pieces) > 1:
+                    out.append("/".join(pieces))
     return out
 
 
@@ -833,6 +1155,14 @@ def _taint_findings_inner(tree: ast.AST, sym: _Symbols, rel: str,
                     lst = scope_lists.get(sub.value.id)
                     if lst and 0 <= sub.slice.value < len(lst):
                         cands.append(str(lst[sub.slice.value]))
+                elif isinstance(sub, ast.Starred) \
+                        and isinstance(sub.value, ast.Name):
+                    lst = scope_lists.get(sub.value.id)
+                    if lst:
+                        pieces = [str(x) for x in lst]
+                        cands.extend(pieces)
+                        if len(pieces) > 1:
+                            cands.append("/".join(pieces))
                 elif isinstance(sub, ast.Name) \
                         and sub.id in scope_strs:
                     cands.append(scope_strs[sub.id])
@@ -1371,7 +1701,8 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict,
                     add("NETWORK_SEND_DATA", rel, line)
                     flags["send"] = (rel, line)
             if joined:
-                _check_credential_value(joined, rel, line, add)
+                _check_credential_value(joined, rel, line, add,
+                                        agent_read=True)
 
         # Decode-class calls (for DECODE_AND_RUN co-occurrence — strictly
         # within THIS file; see the local flags note above).
@@ -1382,13 +1713,23 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict,
             local.setdefault("run_sink", (rel, line))
 
         # Credential values in any folded call argument.
-        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+        # AGENT_CREDENTIAL_READ additionally requires a reader
+        # context (fix wave): open(...) any argument, or a copy
+        # call's first (source) argument.
+        for arg_idx, arg in enumerate(
+                list(node.args) + [kw.value for kw in node.keywords]):
+            agent_read = dotted in ("open", "io.open") or (
+                arg_idx == 0 and (dotted.startswith("shutil.copy")
+                                  or dotted == "copyfile"))
             folded = _fold_str(arg, sym)
             if folded:
-                _check_credential_value(folded, rel, line, add)
+                _check_credential_value(folded, rel, line, add,
+                                        agent_read=agent_read)
             lst = _fold_list(arg, sym)
             if lst:
-                _check_credential_value(" ".join(str(i) for i in lst), rel, line, add)
+                _check_credential_value(" ".join(str(i) for i in lst),
+                                        rel, line, add,
+                                        agent_read=agent_read)
             # A constructor like Path(home, ".s"+"sh", "id_"+"rsa"): join args.
         if node.args and len(node.args) >= 2:
             folded_parts = [_fold_str(a, sym) for a in node.args]
@@ -3377,6 +3718,7 @@ _PRIVATE_STORE_RE = re.compile(
     r"|\.env\b[\w./\\-]*"
     r"|~/\.aws\b|\.aws[/\\]credentials\b"
     r"|login\s+data\b|logins\.json|key4\.db|cookies\.sqlite"
+    r"|~/\.claude/\.credentials\.json\b|~/\.codex/auth\.json\b"
     r"|browser\s+(password|credential|cookie)s?\s+(store|vault|database|file)",
     re.IGNORECASE)
 _OUTBOUND_RE = re.compile(
@@ -3390,6 +3732,9 @@ def _any_language_structure_findings(rel: str, lines: list[str],
     for lineno, line in enumerate(lines, start=1):
         if NEGATION_RE.search(line):
             continue  # safety prose warning against the shape
+        low = line.lower()
+        if any(neg in low for neg in _NON_ENGLISH_NEGATIONS):
+            continue  # same guard, phrase-file languages (audit F10)
         if _PRIVATE_STORE_RE.search(line) and _OUTBOUND_RE.search(line):
             add("ANY_LANGUAGE_STRUCTURE", rel, lineno, line,
                 severity_cap="caution")
@@ -4781,6 +5126,2078 @@ def _folder_inventory(root: Path) -> tuple[set[tuple[str, str]], bool]:
     return py_sources, has_source
 
 
+# --- v0.6: agent-config poisoning matchers -------------------------------
+# Code half: a global-agent-config target (home anchor + agent
+# location, possibly assembled through variables) together with a
+# write/register action in code is AGENT_CONFIG_WRITE at BLOCK. A
+# global agent credential path REFERENCED in code is not enough —
+# AGENT_CREDENTIAL_READ requires an actual read (open/read/cat/
+# copy-source/...), never a mere path construction or an
+# exists/stat metadata check (FP hunt F1). Both rules are
+# direction-aware: a copy OUT of the global config is a backup,
+# not a write (FP hunt F3). A code write that the same file
+# structurally gates behind user mediation — an interactive
+# confirmation primitive in the write's call path, an explicit
+# opt-in flag (--apply/--write/...), or explicit subcommand
+# dispatch — demotes to CAUTION, as does a delete-only write
+# (the uninstaller shape). Reading a global config file is NOT
+# flagged (only writing it), and a target with no home anchor —
+# the skill's own .claude/.codex/.mcp files — never classify.
+
+_AGENT_MCP_ADD_RE = re.compile(
+    r"\b(?:claude|codex|opencode|gemini)\s+mcp\s+add\b", re.IGNORECASE)
+# Redirection counts as a write action ONLY with a shell-ish
+# context (audit F3): a path-shaped target token must follow the
+# operator. `a > b`, `x >> 2`, `-> str:` and generics never match —
+# the operator may not be preceded by an operator character, may
+# not be followed by `=`/`>`, and the next token must start with
+# ~ $ % / ./ or be a word containing a dot or a slash.
+_AGENT_REDIRECT_RE = re.compile(
+    r"(?<![<>=!+\-])>>?(?![=>])\s*['\"]?"
+    r"(?:~|\$|%|/|\./|[\w-]+\.[\w./-]*|[\w-]+/[\w./-]*)")
+_AGENT_WRITE_RES = [
+    re.compile(r"\b(?:write_text|write_bytes|writefile|writefilesync|"
+               r"writetextfile|appendfile|appendfilesync|"
+               r"createwritestream|file_put_contents|outputfile\w*)\b",
+               re.IGNORECASE),
+    re.compile(r"\b(?:shutil\.copy\w*|shutil\.move|copyfile|"
+               r"copyfilesync|os\.replace|os\.rename|"
+               r"fileutils\.(?:cp|mv|copy\w*))\b", re.IGNORECASE),
+    re.compile(r"\.\s*(?:replace|rename)\s*\(", re.IGNORECASE),
+    re.compile(r"(?:::|\.)\s*write(?:lines)?\s*\(", re.IGNORECASE),
+    re.compile(r"\bopen\s*\([^)]*['\"][waxt][+\w]*['\"]", re.IGNORECASE),
+    re.compile(r"\bos\.open\s*\([^)]*\bo_(?:wronly|rdwr|creat|append)\b",
+               re.IGNORECASE),
+    re.compile(r"\b(?:set-content|add-content|out-file)\b", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;&|('\"\x60])(?:sudo\s+)?"
+               r"(?:cp|copy|mv|move|tee|install|rsync)\b", re.IGNORECASE),
+    re.compile(r"\bsed\s+[^|;&]*(?:\s-i\b|--in-place\b)", re.IGNORECASE),
+    re.compile(r"\bperl\b[^|;&\n]*?-\w*i\b", re.IGNORECASE),
+    re.compile(r"\.\s*write(?:lines)?\s*\(", re.IGNORECASE),
+    # Fix wave 2 (G3): dd's output operand, and archive extraction
+    # INTO a directory — both are writes to whatever the target
+    # operand names; the config classification still comes from
+    # the target side of the statement.
+    re.compile(r"\bdd\b[^|;&\n]*\bof\s*=", re.IGNORECASE),
+    re.compile(r"\btar\b[^|;&\n]*?(?:-\w*x\w*\b|--extract\b)"
+               r"[^|;&\n]*?(?:\s-C\s|\s--directory(?:\s|=))",
+               re.IGNORECASE),
+    re.compile(r"\bunzip\b[^|;&\n]*\s-d\s", re.IGNORECASE),
+]
+_AGENT_READ_RES = [
+    re.compile(r"\b(?:read_text|read_bytes|read_file|readfilesync|"
+               r"readfile|createreadstream)\b", re.IGNORECASE),
+    re.compile(r"\.\s*read\s*\(", re.IGNORECASE),
+    re.compile(r"(?:^|[\s;&|('\"\x60])(?:sudo\s+)?cat\b", re.IGNORECASE),
+    re.compile(r"\b(?:json|yaml|toml)\.load\s*\(|\.load\s*\(",
+               re.IGNORECASE),
+    re.compile(r"\brequire\s*\(", re.IGNORECASE),
+    re.compile(r"\bcurl\b[^|;&\n]*@", re.IGNORECASE),
+    re.compile(r"\bdd\s+[^|;&\n]*\bif\s*=", re.IGNORECASE),
+]
+_AGENT_CRED_USE_RE = re.compile(
+    r"\b(?:open|read|read_text|read_bytes|read_file|readfilesync|"
+    r"copy|copyfile|post|put|send|upload|cat|load)\b", re.IGNORECASE)
+_AGENT_ASSIGN_RE = re.compile(
+    r"^\s*(?:export\s+|const\s+|let\s+|var\s+)?(?:mut\s+)?"
+    r"([A-Za-z_$][\w$-]*)\s*(?::[^=\n]+)?=(?![=])\s*(.*)$",
+    re.DOTALL)
+_AGENT_ASSIGN_GO_RE = re.compile(
+    r"^\s*(?:var\s+)?([A-Za-z_$][\w$-]*)\s*"
+    r"(?:,\s*[A-Za-z_$][\w$-]*\s*)*:=\s*(.*)$", re.DOTALL)
+_AGENT_CODE_SUFFIXES = {
+    ".py", ".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".sh",
+    ".bash", ".zsh", ".ps1", ".psm1", ".rb", ".pl", ".php",
+    ".json", ".toml", ".yaml", ".yml", ".go", ".rs", ".bat", ".cmd",
+}
+_AGENT_DATA_SUFFIXES = {".json", ".toml", ".yaml", ".yml"}
+_AGENT_COMMAND_LINE_RE = re.compile(
+    r"\"(?:command|args|preinstall|install|postinstall|prepare|"
+    r"scripts?|exec|run)\"\s*:|mcp\s+add\b|\b(?:cp|tee|sed|install)\b",
+    re.IGNORECASE)
+# For `claude mcp add` inside a DATA file, the command-context gate
+# is a real command KEY (audit F6) — a description string that
+# merely mentions the command is not a command context.
+_AGENT_DATA_CMDKEY_RE = re.compile(
+    r"[\"']?(?:command|args|preinstall|install|postinstall|prepare|"
+    r"scripts?|exec|run)[\"']?\s*[:=]", re.IGNORECASE)
+_AGENT_DOC_CMDKEY_RE = re.compile(
+    r"^\s*(?:-\s*)?[\"']?(?:command|run|exec|script|install|"
+    r"preinstall|postinstall|prepare|args|shell)[\"']?\s*[:=]",
+    re.IGNORECASE)
+_AGENT_CONFIG_FILE_NAMES = ("claude.md", "agents.md", "settings.json",
+                            ".claude.json", "claude_desktop_config.json")
+# The leading context must be a path START (blank, quote, @, =) or a
+# ./ prefix — NOT a bare `/`: `sample/.codex/auth.json` is a file
+# inside a sample folder, not the credential store itself (audit t3).
+_AGENT_REL_CRED_RE = re.compile(
+    r"(?:^|[\s'\"=:@]|\./)(\.claude/\.credentials\.json|"
+    r"\.codex/auth\.json|\.gemini/oauth_creds\.json|"
+    r"opencode/auth\.json)\b")
+_AGENT_REL_CONFIG_RE = re.compile(
+    r"(?:^|[\s'\"=]|\./)(\.(?:claude|codex|gemini|cursor)/|"
+    r"\.cursorrules\b|(?<=[\s'\"=])agents\.md\b|"
+    r"(?<=[\s'\"=])\.mcp\.json\b)", re.IGNORECASE)
+
+
+def _read_quoted(text: str, i: int) -> tuple[str, int] | None:
+    """(content, end_index) of the quoted string starting at i, or
+    None when it does not close on the same line."""
+    q = text[i]
+    buf: list[str] = []
+    j = i + 1
+    while j < len(text):
+        cj = text[j]
+        if cj == "\\" and j + 1 < len(text):
+            buf.append(text[j:j + 2])
+            j += 2
+            continue
+        if cj == q:
+            return "".join(buf), j + 1
+        if cj == "\n":
+            return None
+        buf.append(cj)
+        j += 1
+    return None
+
+
+def _fold_line_concats(text: str) -> str:
+    """Collapse adjacent quoted-string concatenation ('/.cl' +
+    'aude/...' -> '/.claude/...') inside one statement, the
+    line-level mirror of the AST folded-value layer, so split
+    literals judge like the path they assemble (rt18/rt20/rt46).
+    Hand-scanned, linear per pass: the regex form backtracked
+    catastrophically on quote-dense lines (v03 regression)."""
+    for _ in range(8):
+        out: list[str] = []
+        i = 0
+        changed = False
+        while i < len(text):
+            ch = text[i]
+            if ch in ("'", '"'):
+                first = _read_quoted(text, i)
+                if first is not None:
+                    content, end = first
+                    k = end
+                    while k < len(text) and text[k] in " \t":
+                        k += 1
+                    if k < len(text) and text[k] == "+":
+                        k2 = k + 1
+                        while k2 < len(text) and text[k2] in " \t":
+                            k2 += 1
+                        if k2 < len(text) and text[k2] in ("'", '"'):
+                            second = _read_quoted(text, k2)
+                            if second is not None:
+                                content2, end2 = second
+                                out.append(ch + content + content2 + ch)
+                                i = end2
+                                changed = True
+                                continue
+                    out.append(text[i:end])
+                    i = end
+                    continue
+            out.append(ch)
+            i += 1
+        new = "".join(out)
+        if not changed:
+            return new
+        text = new
+    return text
+
+
+def _logical_statements(lines: list[str],
+                        join_braces: bool = True) -> list[tuple[int, int, str]]:
+    """Join physical lines into logical statements: a statement
+    continues while brackets are unbalanced (quote-aware) or the
+    line ends with a backslash, so a wrapped Path.home() join or a
+    continued shell command judges like the one-liner it is
+    (FP hunt F5). Returns (start_line, end_line, text).
+
+    With join_braces=False (shell files), `{`/`}` do not join:
+    a shell function body is a sequence of separate commands, and
+    fusing it into one statement hid every command inside it from
+    the per-statement matchers (FP round 2 F7)."""
+    stmts: list[tuple[int, int, str]] = []
+    buf: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    for idx, line in enumerate(lines, start=1):
+        if not buf:
+            start = idx
+        buf.append(line)
+        j = 0
+        while j < len(line):
+            ch = line[j]
+            if quote:
+                if len(quote) == 1 and ch == "\\":
+                    j += 2
+                    continue
+                if line.startswith(quote, j):
+                    j += len(quote)
+                    quote = None
+                    continue
+                j += 1
+                continue
+            if ch in ("'", '"', "`"):
+                if ch in ("'", '"') and line.startswith(ch * 3, j):
+                    quote = ch * 3
+                    j += 3
+                    continue
+                quote = ch
+                j += 1
+                continue
+            if ch in "([{":
+                if join_braces or ch != "{":
+                    depth += 1
+            elif ch in ")]}":
+                if join_braces or ch != "}":
+                    depth -= 1
+            j += 1
+        cont = depth > 0 or line.rstrip().endswith("\\")
+        if not cont or len(buf) >= 50:
+            stmts.append((start, idx, "\n".join(buf)))
+            buf = []
+            depth = 0
+    if buf:
+        stmts.append((start, len(lines), "\n".join(buf)))
+    return stmts
+
+
+def _docstring_spans(source: str) -> dict[int, list[tuple[int, int]]] | None:
+    """Spans of TRUE docstrings only (module / class / function
+    first-statement string literals) in a Python source. setup.py
+    blanking for the agent matchers is limited to these: a plain
+    string literal in setup.py is code data, not documentation
+    (rt40). None when the source does not parse."""
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return None
+    spans: dict[int, list[tuple[int, int]]] = {}
+
+    def visit(node: ast.AST) -> None:
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)) and body:
+            first = body[0]
+            if isinstance(first, ast.Expr) \
+                    and isinstance(first.value, ast.Constant) \
+                    and isinstance(first.value.value, str):
+                n = first.value
+                for ln in range(n.lineno, (n.end_lineno or n.lineno) + 1):
+                    lo = n.col_offset if ln == n.lineno else 0
+                    hi = n.end_col_offset if ln == n.end_lineno else 1 << 30
+                    spans.setdefault(ln, []).append((lo, hi))
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
+    return spans
+
+
+def _call_args(text: str, open_idx: int) -> list[str] | None:
+    """Split the argument list whose '(' is at open_idx (bounded,
+    quote/paren aware). None when it does not close nearby."""
+    depth = 0
+    quote: str | None = None
+    args: list[str] = []
+    cur: list[str] = []
+    j = open_idx
+    while j < len(text) and j < open_idx + 1000:
+        ch = text[j]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and quote in ("'", '"'):
+                if j + 1 < len(text):
+                    cur.append(text[j + 1])
+                    j += 2
+                    continue
+            elif ch == quote:
+                quote = None
+            j += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            cur.append(ch)
+        elif ch in "([{":
+            depth += 1
+            if depth > 1:
+                cur.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur))
+                return args
+            cur.append(ch)
+        elif ch == "," and depth == 1:
+            args.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        j += 1
+    return None
+
+
+_COPY_CALL_RE = re.compile(
+    r"\b(?:shutil\.copy\w*|shutil\.move|copyfile|copyfilesync|"
+    r"os\.replace|os\.rename|fileutils\.(?:cp|mv|copy\w*)|"
+    r"fs\.copyfile\w*|fs\.copy\w*)\s*\(", re.IGNORECASE)
+_COPY_METHOD_RE = re.compile(r"\.\s*(?:replace|rename)\s*\(", re.IGNORECASE)
+_SHELL_VERB_RE = re.compile(
+    r"(?:^|[\s;&|('\"\x60])(?:sudo\s+)?"
+    r"(cp|copy|mv|move|tee|install|rsync)\b", re.IGNORECASE)
+
+
+def _copy_regions(text: str) -> tuple[str, str] | None:
+    """(source_text, destination_text) when the statement is a
+    copy/move, else None. Call form: first argument is the source,
+    the rest the destination. Shell form: last operand is the
+    destination (tee writes to every operand). Method form
+    (path.replace(dst)): the receiver is the source."""
+    m = _COPY_CALL_RE.search(text)
+    if m:
+        args = _call_args(text, m.end() - 1)
+        if args and len(args) >= 2:
+            return args[0], " ".join(args[1:])
+        return None
+    m = _COPY_METHOD_RE.search(text)
+    if m:
+        args = _call_args(text, m.end() - 1)
+        if args:
+            return text[:m.start()], " ".join(args)
+        return None
+    m = _SHELL_VERB_RE.search(text)
+    if m:
+        rest = text[m.end():]
+        cut = len(rest)
+        for sep in (";", "|", "&&", "||"):
+            p = rest.find(sep)
+            if p != -1:
+                cut = min(cut, p)
+        rest = rest[:cut]
+        try:
+            import shlex
+            tokens = shlex.split(rest)
+        except Exception:
+            tokens = rest.split()
+        operands: list[str] = []
+        skip_next = False
+        for tok in tokens:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok.startswith("-") and tok != "-":
+                if tok in ("-t", "--target-directory", "-o", "-m"):
+                    skip_next = True
+                continue
+            if tok in ("{", "}"):
+                continue  # a fused statement's brace is not an operand
+            operands.append(tok)
+        if len(operands) >= 2:
+            if m.group(1).lower() == "tee":
+                return "", " ".join(operands)
+            return " ".join(operands[:-1]), operands[-1]
+        if len(operands) == 1 and m.group(1).lower() == "tee":
+            return "", operands[0]
+    return None
+
+
+def _region_has_target(region: str, home_vars, part_vars, config_vars,
+                       agent_vars, rel_targets) -> bool:
+    if not region:
+        return False
+    if _agent_target_in_text(region, home_vars, part_vars, config_vars):
+        return True
+    return _tokens_present(region, agent_vars) \
+        or _tokens_present(region, rel_targets)
+
+
+def _region_has_cred(region: str, home_vars, part_vars, cred_vars) -> bool:
+    if not region:
+        return False
+    if _agent_credential_in_text(region, home_vars, part_vars):
+        return True
+    return _tokens_present(region, cred_vars)
+
+
+def _open_write_mode(text: str, str_vars: dict) -> bool:
+    """open(...) in a write mode: quoted mode, or a bare mode
+    variable whose tracked literal is a write mode (rt24:
+    MODE = 'a'; open(target, MODE)). The mode is read from the
+    call's actual second argument (arg-split, so nested calls in
+    the path argument — expanduser(...) — do not hide it, rt41)."""
+    m = re.search(r"\bopen\s*\(", text)
+    if m:
+        args = _call_args(text, m.end() - 1)
+        if args and len(args) >= 2:
+            mode_arg = args[1].strip()
+            if "=" in mode_arg and mode_arg.split("=", 1)[0].strip() \
+                    in ("mode", "m"):
+                mode_arg = mode_arg.split("=", 1)[1].strip()
+            qm = re.match(r"(['\"])([waxt][+\w]*)\1", mode_arg)
+            if qm:
+                return True
+            if re.fullmatch(r"[A-Za-z_$][\w$-]*", mode_arg) \
+                    and mode_arg in str_vars:
+                mode = str_vars[mode_arg].strip()
+                return bool(mode) and (mode[0] in "wax" or "+" in mode)
+            return False
+    if re.search(r"\bopen\s*\([^)]*['\"][waxt][+\w]*['\"]", text,
+                 re.IGNORECASE):
+        return True
+    m = re.search(r"\bopen\s*\([^)]*?,\s*([A-Za-z_$][\w$-]*)\s*[,)]",
+                  text)
+    if m and m.group(1) in str_vars:
+        mode = str_vars[m.group(1)].strip()
+        return bool(mode) and (mode[0] in "wax" or "+" in mode)
+    return False
+
+
+def _agent_write_action(line: str, str_vars: dict | None = None) -> bool:
+    if _AGENT_MCP_ADD_RE.search(line):
+        return True
+    if _AGENT_REDIRECT_RE.search(line):
+        return True
+    if _open_write_mode(line, str_vars or {}):
+        return True
+    return any(p.search(line) for p in _AGENT_WRITE_RES)
+
+
+def _agent_read_action(line: str, str_vars: dict | None = None) -> bool:
+    if any(p.search(line) for p in _AGENT_READ_RES):
+        return True
+    if re.search(r"\bopen\s*\(", line) \
+            and not _open_write_mode(line, str_vars or {}):
+        return True
+    return False
+
+
+def _agent_redirect_pos(line: str) -> int | None:
+    m = _AGENT_REDIRECT_RE.search(line)
+    return m.start() if m else None
+
+
+_SED_DELETE_RE = re.compile(
+    r"\bsed\b[^|;&\n]*['\"][^'\"]*/d['\"]", re.IGNORECASE)
+
+
+def _is_sed_delete(text: str) -> bool:
+    """A sed invocation whose script DELETES lines (the uninstaller
+    shape) rather than substituting content into the file."""
+    return bool(_SED_DELETE_RE.search(text))
+
+
+def _agent_cred_write_only(line: str) -> bool:
+    """The credential path is the DESTINATION of a write on this
+    line (a config tool restoring a credentials file), not a read."""
+    low = line.lower()
+    if re.search(r"(?:\.credentials\.json|auth\.json|oauth_creds\.json)"
+                 r"[^)]*\)\s*\.\s*(?:write_text|write_bytes)\s*\(", low):
+        return True
+    if re.search(r"\bopen\s*\([^)]*(?:\.credentials\.json|auth\.json|"
+                 r"oauth_creds\.json)[^)]*,\s*['\"][wa]", low):
+        return True
+    if re.search(r"\b(?:writefile|writefilesync|appendfile|"
+                 r"appendfilesync)\s*\(\s*[^,)]*"
+                 r"(?:\.credentials\.json|auth\.json|oauth_creds\.json)",
+                 low):
+        return True
+    return False
+
+
+def _track_block(stmts) -> tuple[set, set, set, set, dict, dict]:
+    """Tracking-only pass over logical statements (no findings):
+    returns (home_vars, agent_vars, cred_vars, config_vars,
+    part_vars, assign_kinds). Used to classify sibling-module
+    assignments (rt23) and same-file function returns (rt22) with
+    exactly the main matcher's variable semantics, including
+    reassignment kills (audit F4)."""
+    home_vars: set[str] = set()
+    agent_vars: set[str] = set()
+    cred_vars: set[str] = set()
+    config_vars: set[str] = set()
+    part_vars: dict[str, str] = {}
+    kinds: dict[str, str] = {}
+    for _s, _e, raw in stmts:
+        line = _fold_line_concats(raw)
+        m = _AGENT_ASSIGN_RE.match(line) or _AGENT_ASSIGN_GO_RE.match(line)
+        if not m:
+            mm = re.match(r"^\s*([A-Za-z_$][\w$-]*)\s*\.\s*"
+                          r"(?:push|append|join)\s*\(", line)
+            if mm and mm.group(1) in home_vars:
+                comps = _comps_join(line)
+                if comps and _agent_segment_match("/" + comps.lower()):
+                    agent_vars.add(mm.group(1))
+                elif comps and _AGENT_CRED_PATH_RE.search(
+                        "/" + comps.lower()):
+                    cred_vars.add(mm.group(1))
+            continue
+        var, rhs = m.group(1), m.group(2)
+        was_home = var in home_vars
+        home_vars.discard(var)
+        agent_vars.discard(var)
+        cred_vars.discard(var)
+        config_vars.discard(var)
+        part_vars.pop(var, None)
+        kinds.pop(var, None)
+        compact_rhs = _agent_compact(rhs)
+        if _AGENT_HOME_ANCHOR_RE.search(compact_rhs) \
+                or _tokens_present(rhs, home_vars) or was_home \
+                and _tokens_present(rhs, {var}):
+            home_vars.add(var)
+            kinds[var] = "home"
+        comps = "/".join(
+            c.replace("\\", "/").strip("/").lower()
+            for c in _quoted_components(rhs))
+        if comps and (_agent_segment_match("/" + comps)
+                      or _AGENT_CRED_PATH_RE.search("/" + comps)):
+            part_vars[var] = comps
+        if _agent_target_in_text(line, home_vars, part_vars,
+                                 config_vars) \
+                or _tokens_present(rhs, agent_vars):
+            agent_vars.add(var)
+            kinds[var] = "agent"
+        if _agent_credential_in_text(line, home_vars, part_vars):
+            cred_vars.add(var)
+            kinds[var] = "cred"
+        if var in home_vars and (
+                "xdg_config_home" in compact_rhs
+                or comps == ".config" or comps.endswith("/.config")):
+            config_vars.add(var)
+    return home_vars, agent_vars, cred_vars, config_vars, part_vars, kinds
+
+
+_SIBLING_KINDS_CACHE: dict = {}
+
+
+def _sibling_var_kinds(path: Path) -> dict[str, str]:
+    """Path-variable kinds (home/agent/cred) from TOP-LEVEL literal
+    assignments in same-folder Python sibling modules (rt23,
+    bounded: same folder only, top-level assignments only, and the
+    caller seeds only names the file actually imports)."""
+    folder = path.parent
+    try:
+        files = sorted(p for p in folder.glob("*.py")
+                       if p.name != path.name)
+    except OSError:
+        return {}
+    if not files:
+        return {}
+    try:
+        key = (str(folder), tuple(
+            (p.name, p.stat().st_mtime_ns, p.stat().st_size)
+            for p in files))
+    except OSError:
+        return {}
+    if key in _SIBLING_KINDS_CACHE:
+        return _SIBLING_KINDS_CACHE[key]
+    kinds: dict[str, str] = {}
+    for p in files:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        sib_lines = text.splitlines()
+        _ccols, _spans = _py_inert_regions(text)
+        comments = {ln: [(c, len(sib_lines[ln - 1]))]
+                    for ln, c in _ccols.items() if ln <= len(sib_lines)}
+        blanked = _blank_spans(sib_lines, comments) if comments \
+            else sib_lines
+        top = [(s, e, t) for s, e, t in _logical_statements(blanked)
+               if t.strip() and not t[:1].isspace()]
+        _h, _a, _c, _cfg, _pv, file_kinds = _track_block(top)
+        for name, kind in file_kinds.items():
+            kinds.setdefault(name, kind)
+    _SIBLING_KINDS_CACHE.clear()
+    _SIBLING_KINDS_CACHE[key] = kinds
+    return kinds
+
+
+def _imported_sibling_names(lines: list[str], path: Path) -> set[str]:
+    """Names this Python file imports from a sibling module that
+    exists in the same folder (plus every kinded name of a module
+    imported wholesale, which can only matter if the name is
+    actually used in this file)."""
+    names: set[str] = set()
+    kinds_cache: dict[str, str] | None = None
+    for line in lines:
+        m = re.match(r"\s*from\s+([\w.]+)\s+import\s+(.+)$", line)
+        if m:
+            mod = m.group(1).split(".")[0]
+            if (path.parent / (mod + ".py")).exists():
+                for piece in m.group(2).strip("()").split(","):
+                    piece = piece.strip()
+                    if not piece:
+                        continue
+                    name = re.split(r"\s+as\s+", piece)[-1].strip()
+                    if re.fullmatch(r"[A-Za-z_$][\w$-]*", name):
+                        names.add(name)
+            continue
+        m = re.match(r"\s*import\s+([\w.]+)", line)
+        if m:
+            mod = m.group(1).split(".")[0]
+            if (path.parent / (mod + ".py")).exists():
+                if kinds_cache is None:
+                    kinds_cache = _sibling_var_kinds(path)
+                names.update(kinds_cache)
+    return names
+
+
+
+# --- mediation & removal demotion (FP hunt F2/F4; fix wave 2) -------------
+# A code write to a global config demotes BLOCK -> CAUTION when the
+# tool STRUCTURALLY gates it behind user mediation. The signals
+# (documented in AUDIT_COVERAGE; all fakeable, which is acceptable
+# at CAUTION tier — CAUTION still means "stop and look"):
+#   M1  an interactive confirmation primitive (input(), readline,
+#       click.confirm, prompt libraries incl. the JS `prompts`
+#       package, GUI dialogs — tkinter.messagebox / QMessageBox,
+#       Ruby $stdin.gets, shell `read -p`) in the write's call
+#       path (Python: the write's function plus its callers, two
+#       hops; other languages: the same file);
+#   M2  an explicit opt-in flag — ANY store_true flag, by shape,
+#       not by name (fix wave 2 W2) — whose condition actually
+#       guards the write (fix wave 2 D2);
+#   M3  explicit subcommand dispatch — argparse subparsers with a
+#       subcommand comparison in the call path, a sys.argv dispatch
+#       block containing the write, or a shell `case "$1"` branch
+#       containing the write;
+#   D   delete-only writes: a sed delete script, or a Python write
+#       whose call path only REMOVES content read from the config
+#       (comprehension with `not in`, or .pop() after a read) — the
+#       uninstaller shape. Key-ADDITION shapes (.update({..}),
+#       {**cfg, "k": v} merges, .setdefault, literal subscript
+#       stores) are writes, not deletions (fix wave 2 D3);
+#   W1  folder mediation: a primitive in ANOTHER file of the
+#       folder demotes the write when that file references this
+#       file (import, call, or a subprocess path to the script).
+#
+# Fix wave 2 hardening (red team round 2): signal matching runs on
+# CODE ONLY — comments and string contents are blanked first (D1),
+# so a primitive that appears only in a comment or a help string
+# demotes nothing; an opt-in flag demotes only when its condition
+# lexically guards the write and the condition can actually be
+# false — `if args.apply or True:` is a tautology, not a gate
+# (D2); a shell `read -p` demotes only when it actually guards
+# the write — same region and effective, or a prompt function
+# invoked as the condition of the block that performs the write;
+# a prompt stranded in a dead branch demotes nothing (D4); and a
+# Python helper that merely DEFINES a primitive demotes a
+# file-scope target only when the helper is actually called from
+# the write's call path (D5). Environment-variable and config-file
+# opt-ins are NOT mediation signals (W6, documented in
+# AUDIT_COVERAGE): no human is guaranteed in that loop.
+
+_AGENT_MEDIATE_CONFIRM_RE = re.compile(
+    r"\binput\s*\(|\braw_input\s*\(|\breadline\b|click\.confirm|"
+    r"typer\.confirm|\bconfirm\s*\(|inquirer|questionary|Prompt\.ask|"
+    r"\bprompt\s*\(|\bprompts\s*\(|messagebox\.ask\w+|\baskyesno\b|"
+    r"QMessageBox|\$stdin\.gets|\bSTDIN\.gets", re.IGNORECASE)
+_AGENT_MEDIATE_FLAG_DEF_RE = re.compile(
+    r"add_argument\(\s*['\"]--([\w-]+)['\"][^)]{0,240}?"
+    r"action\s*=\s*['\"]store_true['\"]", re.DOTALL)
+_AGENT_SUBCOMMAND_CMP_RE = re.compile(r"\bargs\.\w+\s*(?:==|!=)")
+_AGENT_FILTER_COMPREHENSION_RE = re.compile(
+    r"\[\s*[\w.]+\s+for\s+[\s\S]{0,200}?\bif\b[\s\S]{0,120}?\bnot in\b")
+_AGENT_SHELL_CONFIRM_RE = re.compile(r"\bread\s+[^|;&\n]*?-\w*p\b")
+_AGENT_KEY_ADD_UPDATE_RE = re.compile(r"\.update\s*\(\s*\{")
+_AGENT_KEY_ADD_MERGE_RE = re.compile(r"\{\s*\*\*\s*\w+\s*,")
+_AGENT_SUBSCRIPT_ASSIGN_RE = re.compile(
+    r"[\w.\]\)]\s*(?:\[[^\]\n]*\]\s*)+=\s*(?![=])([\s\S]{0,300})")
+_AGENT_FILTERED_NAME_RE = re.compile(
+    r"([A-Za-z_$][\w$-]*)\s*=\s*(?:\[[^\n]*\bfor\b[^\n]*\bin\b"
+    r"|\{[^}\n]*\bfor\b[^}\n]*\bin\b|filter\s*\()")
+_TAUTOLOGY_RE = re.compile(
+    r"\bor\s+(?:True|1|true)\b|\b(?:True|1|true)\s+or\b")
+
+
+def _signal_lines(suffix: str, detection: list[str],
+                  string_spans: dict) -> list[str]:
+    """The code-only view used for MEDIATION SIGNAL matching (fix
+    wave 2 D1): `detection` is already comment-blanked; string
+    contents are blanked on top, so a primitive named in a comment
+    or in a help string — never called — is not a signal. Write
+    DETECTION is unchanged (paths live in strings); this view is
+    for signals only. Flag DEFINITIONS are read from `detection`,
+    not from here: a flag's name is an API string by design, and
+    the guard that must reference it is matched here, in code."""
+    if string_spans:
+        return _blank_spans(detection, string_spans)
+    if suffix in (".sh", ".bash", ".zsh"):
+        out = []
+        for line in detection:
+            line = re.sub(r'"[^"\n]*"', '""', line)
+            line = re.sub(r"'[^'\n]*'", "''", line)
+            out.append(line)
+        return out
+    return detection
+
+
+def _py_if_branches(lines: list[str], header_idx: int):
+    """Branch body ranges of the if statement whose header is at
+    lines[header_idx] (0-based). Returns (branches, end_idx) with
+    branches a list of (kind, header_idx, start_idx, end_idx),
+    kind in if/elif/else, ranges 0-based inclusive over BODY
+    lines; end_idx is the statement's last line."""
+    ind = len(lines[header_idx]) - len(lines[header_idx].lstrip())
+    branches: list[tuple[str, int, int, int]] = []
+    kind = "if"
+    hidx = header_idx
+    start = header_idx + 1
+    end = header_idx
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        if line.strip():
+            li = len(line) - len(line.lstrip())
+            if li <= ind:
+                s = line.strip()
+                if li == ind and (s.startswith("elif ")
+                                  or s.startswith("else")):
+                    branches.append((kind, hidx, start, i - 1))
+                    kind = "elif" if s.startswith("elif") else "else"
+                    hidx, start, end = i, i + 1, i
+                    i += 1
+                    continue
+                break
+            end = i
+        i += 1
+    branches.append((kind, hidx, start, end))
+    return branches, end
+
+
+def _flag_ranges(signal_lines: list[str],
+                 detection_lines: list[str],
+                 struct: dict | None) -> list[tuple[int, int]]:
+    """M2 (fix wave 2 D2/W2; audit round 2 R2-F2): the 1-based
+    inclusive line ranges in which a write is guarded by an
+    opt-in store_true flag — ANY flag name, matched by shape.
+    Computed ONCE per file (the demote answer is file-scoped;
+    recomputing it per write was quadratic).
+
+    A range counts only when the flag condition can actually
+    keep the write from running by default, i.e. the write runs
+    only when the flag is TRUE:
+      * the write sits in the if/elif branch of a condition that
+        references the flag POSITIVELY (`if args.apply:`), or
+      * the write follows an early-exit guard whose condition
+        references the flag NEGATED (`if not args.commit:
+        ... return`) in the same function.
+    A tautological condition (`if args.apply or True:`) guards
+    nothing, and an opt-OUT flag's positive guard (`if
+    args.dry_run: return` — the write runs whenever the flag is
+    absent) guards nothing either: polarity is the difference
+    between an opt-in and an opt-out, whatever the flag is
+    named."""
+    file_text = "\n".join(detection_lines)
+    attrs = {f.replace("-", "_")
+             for f in _AGENT_MEDIATE_FLAG_DEF_RE.findall(file_text)}
+    if not attrs:
+        return []
+    scope_of = struct["_scope_of"] if struct is not None else None
+    ranges: list[tuple[int, int]] = []
+    for idx, line in enumerate(signal_lines):
+        s = line.strip()
+        if not (s.startswith("if ") or s.startswith("elif ")
+                or s.startswith("while ")):
+            continue
+        cond = s.split(":", 1)[0]
+        hit = None
+        for attr in attrs:
+            if re.search(rf"\bargs\.{re.escape(attr)}\b", cond):
+                hit = attr
+                break
+        if hit is None or _TAUTOLOGY_RE.search(cond):
+            continue
+        negated = bool(re.search(
+            rf"\bnot\s+args\.{re.escape(hit)}\b", cond))
+        branches, end = _py_if_branches(signal_lines, idx)
+        if not negated:
+            for kind, _h, bs, be in branches:
+                if kind in ("if", "elif"):
+                    ranges.append((bs + 1, be + 1))
+        else:
+            # Early-exit guard: the if-branch bails out, and the
+            # write follows the statement in the same function.
+            for kind, _h, bs, be in branches:
+                if kind != "if":
+                    continue
+                body = "\n".join(signal_lines[bs:be + 1])
+                if re.search(r"\breturn\b|\braise\b|sys\.exit\s*\("
+                             r"|\bexit\s*\(", body):
+                    hi = len(signal_lines)
+                    if scope_of is not None:
+                        sc = scope_of(idx + 1)
+                        if sc != "<module>":
+                            hi = struct["funcs"][sc][1]
+                    ranges.append((end + 2, hi))
+    return ranges
+
+
+def _delete_only(scopes_text: str) -> bool:
+    """D (fix wave 2 D3): the write's call path only REMOVES
+    config content — a .pop() or a filter comprehension over data
+    read from the config — and adds NOTHING: no .update({...})
+    with literal keys, no {**cfg, "k": v} merge, no .setdefault,
+    and no subscript store whose value is not itself a filter
+    over the read data. Key-addition shapes are writes."""
+    if ".pop(" not in scopes_text and not \
+            _AGENT_FILTER_COMPREHENSION_RE.search(scopes_text):
+        return False
+    if not ("read_text" in scopes_text or "json.load" in scopes_text
+            or _AGENT_FILTER_COMPREHENSION_RE.search(scopes_text)):
+        return False
+    if _AGENT_KEY_ADD_UPDATE_RE.search(scopes_text):
+        return False
+    if _AGENT_KEY_ADD_MERGE_RE.search(scopes_text):
+        return False
+    if ".setdefault(" in scopes_text:
+        return False
+    filtered = set(_AGENT_FILTERED_NAME_RE.findall(scopes_text))
+    for m in _AGENT_SUBSCRIPT_ASSIGN_RE.finditer(scopes_text):
+        val = m.group(1).strip()
+        if re.search(r"\bfor\b[\s\S]{0,200}?\bin\b", val):
+            continue  # a filter over the read data: still removal
+        if val.split("[")[0].strip().rstrip(",") in filtered:
+            continue  # storing a filtered copy back: still removal
+        if val in filtered:
+            continue
+        return False
+    return True
+
+
+def _shell_funcs(lines: list[str]) -> dict[str, tuple[int, int]]:
+    """Shell function definitions: name -> (start, end) 1-based
+    inclusive line range. A body ends at the first line that is
+    only `}`."""
+    funcs: dict[str, tuple[int, int]] = {}
+    i = 0
+    while i < len(lines):
+        m = re.match(r"\s*(?:function\s+)?([A-Za-z_]\w*)\s*\(\s*\)",
+                     lines[i])
+        if m:
+            start = i + 1
+            end = start
+            j = i + 1
+            while j < len(lines):
+                if lines[j].strip() == "}":
+                    end = j + 1
+                    break
+                end = j + 1
+                j += 1
+            funcs[m.group(1)] = (start, end)
+            i = j if j > i else i + 1
+            continue
+        i += 1
+    return funcs
+
+
+def _shell_blocks(lines: list[str]) -> list[tuple[int, int]]:
+    """(start, end) 1-based inclusive ranges of shell conditional
+    blocks (if/for/while/case … fi/done/esac), by keyword depth."""
+    blocks: list[tuple[int, int]] = []
+    stack: list[int] = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if re.match(r"(?:if|for|while|until|case)\b", s):
+            stack.append(i)
+        elif re.match(r"(?:fi|done|esac)\b", s):
+            if stack:
+                blocks.append((stack.pop(), i))
+    for h in stack:
+        blocks.append((h, len(lines)))
+    return blocks
+
+
+def _shell_ctx(signal_lines: list[str],
+               detection_lines: list[str]) -> dict:
+    """Shell mediation inputs, computed ONCE per file (audit
+    round 2 R2-F2): the set of lines inside a `case "$1"`
+    dispatch, the prompt lines, function ranges and conditional
+    blocks."""
+    norm = [dl.replace("${1:-}", "$1").replace("${1}", "$1")
+            for dl in detection_lines]
+    case_lines: set[int] = set()
+    in_case = False
+    for i, dl in enumerate(norm, start=1):
+        if re.match(r"\s*case\s+.*(?:\$1|\$\{1\}|\$@|\$\{@)", dl):
+            in_case = True
+        elif re.match(r"\s*esac\b", dl):
+            in_case = False
+        if in_case:
+            case_lines.add(i)
+    return {
+        "case_lines": case_lines,
+        "prompts": [i for i, dl in enumerate(signal_lines, start=1)
+                    if _AGENT_SHELL_CONFIRM_RE.search(dl)],
+        "funcs": _shell_funcs(signal_lines),
+        "blocks": _shell_blocks(signal_lines),
+        "signal": signal_lines,
+    }
+
+
+def _shell_demote(ctx: dict, lineno: int) -> bool:
+    """Shell mediation (fix wave 2 D4): a `read -p` demotes only
+    when it can actually stop the write —
+      * the write sits in a `case "$1"` dispatch branch (M3;
+        ${1:-} / ${1} normalised to $1 — FP round 2 F6), or
+      * the prompt is in the write's own region (same function,
+        or top level), before the write, and not stranded inside
+        a conditional block that excludes the write (a dead
+        branch), or
+      * the prompt lives in a function that is invoked as the
+        CONDITION of the block performing the write (directly,
+        or via a call to the write's function).
+    Prompt matching runs on signal lines (strings blanked, D1)."""
+    if lineno in ctx["case_lines"]:
+        return True
+    prompts = ctx["prompts"]
+    if not prompts:
+        return False
+    funcs = ctx["funcs"]
+    blocks = ctx["blocks"]
+    signal_lines = ctx["signal"]
+
+    def region(i: int) -> str | None:
+        for nm, (s, e) in funcs.items():
+            if s <= i <= e:
+                return nm
+        return None
+
+    def smallest_block(i: int) -> tuple[int, int] | None:
+        cand = [b for b in blocks if b[0] <= i <= b[1]]
+        return min(cand, key=lambda b: b[1] - b[0]) if cand else None
+
+    write_region = region(lineno)
+    for p in prompts:
+        if region(p) == write_region and p < lineno:
+            blk = smallest_block(p)
+            if blk is None or blk[0] <= lineno <= blk[1]:
+                return True
+    # Prompt inside a function invoked as a block condition.
+    for hs, he in blocks:
+        header = signal_lines[hs - 1]
+        if not re.match(r"\s*if\b", header):
+            continue
+        if not (hs <= lineno <= he or (
+                write_region and any(
+                    re.search(rf"\b{re.escape(write_region)}\b",
+                              signal_lines[j - 1])
+                    for j in range(hs, he + 1)))):
+            continue
+        for nm, (s, e) in funcs.items():
+            if not re.search(rf"\b{re.escape(nm)}\b", header):
+                continue
+            for p in prompts:
+                if s <= p <= e:
+                    blk = smallest_block(p)
+                    if blk is None or (s <= blk[0] and blk[1] <= e):
+                        return True
+    return False
+
+
+_FOLDER_GATE_CACHE: dict = {}
+
+
+def _gate_signal_text(path: Path, text: str) -> str:
+    """Code-only view of a NEIGHBOURING file for the folder gate:
+    comments and string contents blanked per language, so the
+    gate's primitive must be real code (D1 discipline)."""
+    suffix = path.suffix.lower()
+    lines = text.splitlines()
+    if suffix == ".py":
+        return _strip_py_strings(text)
+    if suffix in (".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx"):
+        cs, ss = _js_inert_regions(lines)
+        return "\n".join(_blank_spans(_blank_spans(lines, cs), ss))
+    if suffix in (".sh", ".bash", ".zsh"):
+        cs = {}
+        for ln, lt in enumerate(lines, start=1):
+            c = _shell_comment_col(lt)
+            if c is not None:
+                cs[ln] = [(c, len(lt))]
+        return "\n".join(_signal_lines(".sh",
+                                       _blank_spans(lines, cs), {}))
+    return text
+
+
+def _folder_gate_for(path: Path) -> bool:
+    """W1: folder-level mediation. True when ANOTHER file in the
+    folder neighbourhood (the file's folder, its parent folder,
+    and this folder's immediate sub-folders) contains a real
+    mediation primitive AND references this file — by module
+    import, a call through the module, or the file's basename
+    (the subprocess / script-path shape). Bounded and cached
+    per file."""
+    key = str(path)
+    if key in _FOLDER_GATE_CACHE:
+        return _FOLDER_GATE_CACHE[key]
+    _FOLDER_GATE_CACHE.clear()
+    result = False
+    try:
+        here = path.parent
+        # The file's folder, its parent folder, and this folder's
+        # own sub-folders — deliberately NOT the parent's other
+        # sub-folders: in a corpus layout those are unrelated
+        # skills, and walking them per file is a needless
+        # constant cost (audit round 2 timing shapes).
+        dirs = {here, here.parent}
+        try:
+            dirs.update(p for p in here.iterdir() if p.is_dir())
+        except OSError:
+            pass
+        stem, base = path.stem, path.name
+        for d in sorted(dirs):
+            try:
+                files = sorted(p for p in d.iterdir() if p.is_file())
+            except OSError:
+                continue
+            for g in files:
+                if g == path or g.suffix.lower() \
+                        not in _AGENT_CODE_SUFFIXES:
+                    continue
+                try:
+                    if g.stat().st_size > 512_000:
+                        continue
+                    text = g.read_text(encoding="utf-8",
+                                       errors="replace")
+                except OSError:
+                    continue
+                sig = _gate_signal_text(g, text)
+                if not (_AGENT_MEDIATE_CONFIRM_RE.search(sig)
+                        or _AGENT_SHELL_CONFIRM_RE.search(sig)):
+                    continue
+                if base in text or (stem and re.search(
+                        rf"\bimport\s+{re.escape(stem)}\b"
+                        rf"|\bfrom\s+{re.escape(stem)}\s+import\b"
+                        rf"|\b{re.escape(stem)}\s*\.", text)):
+                    result = True
+                    break
+            if result:
+                break
+    except OSError:
+        result = False
+    _FOLDER_GATE_CACHE[key] = result
+    return result
+
+
+def _py_structure(source_lines: list[str]) -> dict | None:
+    try:
+        tree = ast.parse("\n".join(source_lines))
+    except Exception:
+        return None
+    funcs: dict[str, tuple[int, int]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs[node.name] = (node.lineno, node.end_lineno or node.lineno)
+
+    def scope_of(lineno: int) -> str:
+        best = "<module>"
+        best_span: int | None = None
+        for nm, (s, e) in funcs.items():
+            if s <= lineno <= e and (best_span is None or e - s < best_span):
+                best, best_span = nm, e - s
+        return best
+
+    callers: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            callee = None
+            if isinstance(node.func, ast.Name):
+                callee = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                callee = node.func.attr
+            if callee in funcs:
+                callers.setdefault(callee, set()).add(scope_of(node.lineno))
+    return {"funcs": funcs, "callers": callers, "_scope_of": scope_of}
+
+
+def _py_scopes_text(structure: dict, detection_lines: list[str],
+                    lineno: int) -> str:
+    scope_of = structure["_scope_of"]
+    funcs = structure["funcs"]
+    callers = structure["callers"]
+    seen = {scope_of(lineno)}
+    frontier = list(seen)
+    for _ in range(2):
+        nxt = []
+        for scope in frontier:
+            for caller in callers.get(scope, ()):
+                if caller not in seen:
+                    seen.add(caller)
+                    nxt.append(caller)
+        frontier = nxt
+    parts: list[str] = []
+    for scope in seen:
+        if scope == "<module>":
+            inside = set()
+            for s, e in funcs.values():
+                inside.update(range(s, e + 1))
+            parts.append("\n".join(
+                dl for i, dl in enumerate(detection_lines, start=1)
+                if i not in inside))
+        else:
+            s, e = funcs[scope]
+            parts.append("\n".join(detection_lines[s - 1:e]))
+    return "\n".join(parts)
+
+
+def _argv_block_contains(lines: list[str], lineno: int) -> bool:
+    """The line sits inside an if/elif block whose header dispatches
+    on sys.argv / process.argv / Deno.args (M3b)."""
+    if lineno < 1 or lineno > len(lines):
+        return False
+    indent = len(lines[lineno - 1]) - len(lines[lineno - 1].lstrip())
+    for i in range(lineno - 2, -1, -1):
+        line = lines[i]
+        if not line.strip():
+            continue
+        ind = len(line) - len(line.lstrip())
+        if ind >= indent:
+            continue
+        s = line.strip()
+        if s.startswith(("def ", "async def ", "class ")):
+            return False
+        if s.startswith(("if ", "elif ")) and (
+                "sys.argv" in s or "process.argv" in s
+                or "Deno.args" in s):
+            return True
+        indent = ind
+    return False
+
+
+def _acw_demote(suffix: str, name: str, lineno: int, stmt_text: str,
+                detection_lines: list[str], signal_lines: list[str],
+                evidence_lines: list[str], state: dict,
+                path: Path) -> bool:
+    if _is_sed_delete(stmt_text):
+        return True
+    # Audit round 2 (R2-F2): every file-scoped signal is computed
+    # ONCE per file and cached in `state` — the demote answer is
+    # file/scope-scoped, and recomputing whole-file joins and
+    # scope texts per firing write was quadratic in the number of
+    # firing writes.
+    if "ctx" not in state:
+        ctx: dict = {}
+        if suffix == ".py":
+            st = state.get("py_struct") or _py_structure(
+                evidence_lines)
+            ctx["struct"] = st
+            ctx["det_text"] = "\n".join(detection_lines)
+            ctx["scope_cache"] = {}
+            ctx["flag_ranges"] = _flag_ranges(
+                signal_lines, detection_lines, st)
+            ctx["argv_lines"] = _argv_dispatch_lines(signal_lines)
+            if st is not None:
+                ctx["helpers"] = {
+                    nm for nm, (s, e) in st["funcs"].items()
+                    if _AGENT_MEDIATE_CONFIRM_RE.search(
+                        "\n".join(signal_lines[s - 1:e]))}
+        elif suffix in (".sh", ".bash", ".zsh") or name == "install.sh" \
+                or suffix == "":
+            ctx["shell"] = _shell_ctx(signal_lines, detection_lines)
+        else:
+            ctx["sig_prim"] = bool(_AGENT_MEDIATE_CONFIRM_RE.search(
+                "\n".join(signal_lines)))
+        state["ctx"] = ctx
+    ctx = state["ctx"]
+    if suffix == ".py":
+        st = ctx["struct"]
+        if st is not None:
+            scope = st["_scope_of"](lineno)
+            cached = ctx["scope_cache"].get(scope)
+            if cached is None:
+                scopes_sig = _py_scopes_text(st, signal_lines,
+                                             lineno)
+                cached = (
+                    bool(_AGENT_MEDIATE_CONFIRM_RE.search(scopes_sig)),
+                    any(re.search(rf"\b{re.escape(h)}\s*\(",
+                                  scopes_sig)
+                        for h in ctx["helpers"]),
+                    "add_subparsers" in ctx["det_text"] and bool(
+                        _AGENT_SUBCOMMAND_CMP_RE.search(scopes_sig)),
+                    _delete_only(scopes_sig),
+                )
+                ctx["scope_cache"][scope] = cached
+            if any(cached):
+                return True
+        if any(lo <= lineno <= hi for lo, hi in ctx["flag_ranges"]):
+            return True
+        if lineno in ctx["argv_lines"]:
+            return True
+        return _folder_gate_for(path)
+    if suffix in (".sh", ".bash", ".zsh") or name == "install.sh" \
+            or suffix == "":
+        if _shell_demote(ctx["shell"], lineno):
+            return True
+        return _folder_gate_for(path)
+    if ctx["sig_prim"]:
+        return True
+    return _folder_gate_for(path)
+
+
+def _argv_dispatch_lines(lines: list[str]) -> set[int]:
+    """Lines sitting inside an if/elif branch whose header
+    dispatches on sys.argv / process.argv / Deno.args (M3b),
+    computed once per file (the per-write upward walk in the
+    original _argv_block_contains was linear per write)."""
+    out: set[int] = set()
+    for idx, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("if ") or s.startswith("elif "):
+            if "sys.argv" in s or "process.argv" in s \
+                    or "Deno.args" in s:
+                branches, _end = _py_if_branches(lines, idx)
+                for _kind, _h, bs, be in branches:
+                    out.update(range(bs + 1, be + 2))
+    return out
+
+
+def _agent_func_returns(lines: list[str]) -> set[str]:
+    """Same-file functions whose return expression is a global
+    agent-config path (rt22): a write through `cfg_path()` is a
+    write to the returned path. Bounded: the return expression
+    must itself classify with the function's own local tracking."""
+    funcs: set[str] = set()
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)def\s+([A-Za-z_$][\w$-]*)\s*\(", lines[i])
+        if not m:
+            i += 1
+            continue
+        indent = len(m.group(1))
+        body: list[str] = []
+        j = i + 1
+        while j < len(lines):
+            l = lines[j]
+            if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+                break
+            body.append(l)
+            j += 1
+        stmts = _logical_statements(body)
+        home, agent, _c, cfg, parts, _k = _track_block(stmts)
+        for _s, _e, t in stmts:
+            rm = re.match(r"\s*return\s+([\s\S]+)$", t)
+            if rm and (_agent_target_in_text(rm.group(1), home, parts,
+                                             cfg)
+                       or _tokens_present(rm.group(1), agent)):
+                funcs.add(m.group(2))
+                break
+        i = j if j > i else i + 1
+    return funcs
+
+
+def _match_in_string_spans(raw: str, m: re.Match, start: int,
+                           string_spans: dict) -> bool:
+    """True when regex match `m` in the (unfolded) statement `raw`
+    falls inside a string literal span of its physical line."""
+    if not string_spans:
+        return False
+    line_no = start + raw[:m.start()].count("\n")
+    col = m.start() - (raw.rfind("\n", 0, m.start()) + 1)
+    for lo, hi in string_spans.get(line_no, ()):  # type: ignore[union-attr]
+        if lo <= col < hi:
+            return True
+    return False
+
+
+def _tar_cred_read(line: str, cwd_home: bool) -> bool:
+    """tar creating an archive FROM agent credential stores
+    (FP hunt F5): the members are read, whatever the tool calls
+    itself. Requires a home context: an anchor in the statement,
+    a `-C <home>` or a preceding `cd` home."""
+    if not re.search(r"\btar\s+(?:-\w*c|--create\b|\w*c\w*\s)", line):
+        return False
+    norm = _normalize_path_text(line.replace("\\", "/").lower())
+    if not _AGENT_REL_CRED_RE.search(norm):
+        return False
+    return cwd_home or bool(
+        _AGENT_HOME_ANCHOR_RE.search(_agent_compact(line)))
+
+
+def _py_param_defaults(stmts) -> dict[str, dict[str, str]]:
+    """Function parameters whose DEFAULT is a global agent-config
+    or agent-credential path (fix wave 2 G2): `def run(target=
+    Path.home()/".claude"/"CLAUDE.md")` — the default is tracked
+    as an assignment to the parameter in that function's scope,
+    so a write through the parameter judges like a write to the
+    path. Returns {function: {param: "agent"|"cred"}}."""
+    out: dict[str, dict[str, str]] = {}
+    for _s, _e, text in stmts:
+        m = re.match(r"\s*(?:async\s+)?def\s+([A-Za-z_$][\w$-]*)\s*\(",
+                     text)
+        if not m:
+            continue
+        args = _call_args(text, m.end() - 1)
+        if not args:
+            continue
+        kinds: dict[str, str] = {}
+        for arg in args:
+            if "=" not in arg:
+                continue
+            pname, default = arg.split("=", 1)
+            pname = pname.strip().lstrip("*").split(":")[0].strip()
+            if not re.fullmatch(r"[A-Za-z_$][\w$-]*", pname):
+                continue
+            if _agent_target_in_text(default):
+                kinds[pname] = "agent"
+            elif _agent_credential_in_text(default):
+                kinds[pname] = "cred"
+        if kinds:
+            out[m.group(1)] = kinds
+    return out
+
+
+def _py_helper_readers(lines: list[str]):
+    """Same-file functions whose body READS one of its parameters
+    (fix wave 2 G4): `def load_any(p): return p.read_bytes()`.
+    A call site passing an agent credential path to such a
+    function is a credential read at the call site — one level of
+    argument flow, mirroring the function-return resolution.
+    Returns ({function: [params in order]}, {function: {reader
+    params}})."""
+    order: dict[str, list[str]] = {}
+    readers: dict[str, set[str]] = {}
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)(?:async\s+)?def\s+([A-Za-z_$][\w$-]*)\s*\(",
+                     lines[i])
+        if not m:
+            i += 1
+            continue
+        indent = len(m.group(1))
+        args = _call_args(lines[i], m.end() - 1)
+        params: list[str] = []
+        if args:
+            for arg in args:
+                pname = arg.split("=", 1)[0].split(":")[0] \
+                    .strip().lstrip("*")
+                if re.fullmatch(r"[A-Za-z_$][\w$-]*", pname):
+                    params.append(pname)
+        body: list[str] = []
+        j = i + 1
+        while j < len(lines):
+            l = lines[j]
+            if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+                break
+            body.append(l)
+            j += 1
+        if params:
+            order[m.group(2)] = params
+            found: set[str] = set()
+            for _s, _e, t in _logical_statements(body):
+                if not _agent_read_action(t, {}):
+                    continue
+                toks = {mm.group() for mm in
+                        _AGENT_TOKEN_RE.finditer(t)}
+                found |= toks & set(params)
+            if found:
+                readers[m.group(2)] = found
+        i = j if j > i else i + 1
+    return order, readers
+
+
+def _agent_config_code_findings(rel: str, path: Path, lines: list[str],
+                                evidence_lines: list[str], add,
+                                comment_spans: dict,
+                                string_spans: dict) -> None:
+    suffix = path.suffix.lower()
+    name = path.name.lower()
+    if suffix not in _AGENT_CODE_SUFFIXES \
+            and name not in ("dockerfile", "makefile") \
+            and not name.startswith(("install", "setup")) \
+            and not (suffix == "" and evidence_lines
+                     and evidence_lines[0].lstrip().startswith("#!")):
+        return
+    detection = _blank_spans(lines, comment_spans) if comment_spans \
+        else list(lines)
+    if name == "setup.py":
+        # Only TRUE docstrings are documentation in setup.py; a
+        # plain literal-path write is code and judges as code (rt40).
+        doc_spans = _docstring_spans("\n".join(evidence_lines))
+        if doc_spans is not None:
+            detection = _blank_spans(detection, doc_spans)
+        elif string_spans:
+            detection = _blank_spans(detection, string_spans)
+    data_only = suffix in _AGENT_DATA_SUFFIXES
+    shell = suffix in (".sh", ".bash", ".zsh")
+    if data_only:
+        stmts = [(i, i, l) for i, l in enumerate(detection, start=1)]
+    else:
+        stmts = _logical_statements(detection, join_braces=not shell)
+    # Code-only view for mediation signals (fix wave 2 D1).
+    signal = _signal_lines(suffix, detection, string_spans)
+    home_vars: set[str] = set()
+    agent_vars: set[str] = set()
+    cred_vars: set[str] = set()
+    config_vars: set[str] = set()
+    part_vars: dict[str, str] = {}
+    str_vars: dict[str, str] = {}
+    parent_vars: set[str] = set()
+    rel_targets: set[str] = set()
+    handle_vars: set[str] = set()
+    agent_funcs: set[str] = set()
+    cred_list_vars: set[str] = set()
+    cred_path_vars: set[str] = set()
+    demote_state: dict = {}
+    demote_cache: dict[int, bool] = {}
+    cwd_home = False
+
+    def demote(start: int, stmt_text: str) -> bool:
+        if start not in demote_cache:
+            demote_cache[start] = _acw_demote(
+                suffix, name, start, stmt_text, detection, signal,
+                evidence_lines, demote_state, path)
+        return demote_cache[start]
+
+    if suffix == ".py":
+        imported = _imported_sibling_names(detection, path)
+        if imported:
+            kinds = _sibling_var_kinds(path)
+            for nm in imported:
+                kind = kinds.get(nm)
+                if kind == "home":
+                    home_vars.add(nm)
+                elif kind == "agent":
+                    agent_vars.add(nm)
+                elif kind == "cred":
+                    cred_vars.add(nm)
+        agent_funcs = _agent_func_returns(detection)
+
+    # Fix wave 2 (G2/G4): default-argument path tracking and
+    # one-level helper argument flow, Python only. The structure
+    # is computed lazily: a def-free file has no scopes to seed,
+    # so the ast.parse is skipped (timing) and a stub stands in.
+    if suffix == ".py" and any(
+            re.match(r"\s*(?:async\s+)?def\s", dl)
+            for dl in detection):
+        py_struct = _py_structure(detection)
+    elif suffix == ".py":
+        py_struct = {"funcs": {}, "callers": {},
+                     "_scope_of": lambda _n: "<module>"}
+    else:
+        py_struct = None
+    if py_struct is not None:
+        demote_state["py_struct"] = py_struct
+    param_kinds = _py_param_defaults(stmts) if suffix == ".py" \
+        else {}
+    helper_order, helper_readers = _py_helper_readers(detection) \
+        if suffix == ".py" else ({}, {})
+    seeded_params: dict[str, str] = {}
+
+    for start, _end, raw in stmts:
+        if not raw.strip():
+            continue
+        line = _fold_line_concats(raw)
+        evidence = evidence_lines[start - 1] \
+            if start - 1 < len(evidence_lines) else raw
+        if shell:
+            cd = re.match(r"\s*cd\s+([^;&|]+)", line)
+            if cd and _AGENT_HOME_ANCHOR_RE.search(
+                    _agent_compact(cd.group(1))):
+                cwd_home = True
+        if py_struct is not None:
+            # G2: seed this function's path-valued parameters for
+            # the duration of its scope (the def line itself is
+            # judged unseeded: defaults evaluate in the ENCLOSING
+            # scope).
+            want: dict[str, str] = {}
+            best: tuple[int, str] | None = None
+            for fn, (fs, fe) in py_struct["funcs"].items():
+                if fs < start <= fe and (
+                        best is None or fe - fs < best[0]):
+                    best = (fe - fs, fn)
+            if best is not None:
+                want = param_kinds.get(best[1], {})
+            for pn in list(seeded_params):
+                if pn not in want:
+                    if seeded_params[pn] == "agent":
+                        agent_vars.discard(pn)
+                    else:
+                        cred_vars.discard(pn)
+                    del seeded_params[pn]
+            for pn, kind in want.items():
+                if pn not in seeded_params:
+                    seeded_params[pn] = kind
+                    if kind == "agent":
+                        agent_vars.add(pn)
+                    else:
+                        cred_vars.add(pn)
+        # A statement that ASSIGNS a variable must be judged on its
+        # right-hand side: the LHS mention of a tracked variable is
+        # not a USE of the old binding (audit F4 follow-up — without
+        # this, `target = Path("notes.txt")` re-classified via the
+        # part-vars branch and the stale binding survived).
+        lhs_var = None
+        m0 = _AGENT_ASSIGN_RE.match(line) \
+            or _AGENT_ASSIGN_GO_RE.match(line)
+        if m0:
+            lhs_var = m0.group(1)
+        # `exclude` is threaded through instead of copying the
+        # tracked sets per statement — copying an 11k-entry dict
+        # per line was itself quadratic (fix-wave self-review).
+        target_here = _agent_target_in_text(
+            line, home_vars, part_vars, config_vars, exclude=lhs_var)
+        cred_here = _agent_credential_in_text(
+            line, home_vars, part_vars, exclude=lhs_var)
+        # `tokens` for THIS statement — assigned BEFORE the
+        # cred-list check below that reads it (audit round 2
+        # R2-F3: the check previously consumed the PREVIOUS
+        # statement's token set, in both directions).
+        tokens = {m.group() for m in _AGENT_TOKEN_RE.finditer(line)}
+        if lhs_var:
+            tokens.discard(lhs_var)
+        if not cred_here and cred_list_vars and (
+                tokens & cred_list_vars) and (
+                _AGENT_HOME_ANCHOR_RE.search(_agent_compact(line))
+                or tokens & home_vars):
+            # A variable ranging over a literal list of credential
+            # paths, joined onto a home anchor (FP fixture 08:
+            # `for rel in [".claude/.credentials.json", ...]` then
+            # `Path.home() / rel`) — the joined path IS a store.
+            cred_here = True
+        var_here = bool(tokens & agent_vars)
+        rel_here = bool(tokens & rel_targets)
+        # Token intersection, not one regex per agent function
+        # (audit round 2 R2-F1: O(statements x functions) with
+        # regex-cache thrash past ~512 distinct patterns).
+        func_here = any(
+            re.search(rf"\b{re.escape(fn)}\s*\(", line)
+            for fn in tokens & agent_funcs)
+        action = _agent_write_action(line, str_vars)
+        gated = not data_only or _AGENT_COMMAND_LINE_RE.search(line)
+        copy = _copy_regions(line)
+
+        # --- MCP self-registration --------------------------------
+        mcp = _AGENT_MCP_ADD_RE.search(line)
+        if mcp and not _match_in_string_spans(raw, mcp, start,
+                                              string_spans):
+            if not data_only or _AGENT_DATA_CMDKEY_RE.search(line):
+                add("AGENT_CONFIG_WRITE", rel, start, evidence,
+                    severity_cap="caution" if demote(start, line)
+                    else None)
+        # --- global config write ----------------------------------
+        fire: bool | None = None
+        if copy is not None:
+            fire = _region_has_target(
+                copy[1], home_vars, part_vars, config_vars,
+                agent_vars, rel_targets)
+        if fire is None:
+            rp = _agent_redirect_pos(line)
+            if rp is not None:
+                fire = _region_has_target(
+                    line[rp:], home_vars, part_vars, config_vars,
+                    agent_vars, rel_targets)
+                if not fire:
+                    # A redirect to a NON-config file (2>/dev/null,
+                    # a log) must not hide a separate write verb
+                    # aimed at a config target on the same line
+                    # (dd of=... 2>/dev/null — fix wave 2 G3).
+                    head = line[:rp]
+                    head_target = _agent_target_in_text(
+                        head, home_vars, part_vars, config_vars,
+                        exclude=lhs_var) or _tokens_present(
+                            head, agent_vars) or _tokens_present(
+                                head, rel_targets)
+                    if head_target and (
+                            _AGENT_MCP_ADD_RE.search(head)
+                            or _open_write_mode(head, str_vars)
+                            or any(p.search(head)
+                                   for p in _AGENT_WRITE_RES)):
+                        fire = True
+                    else:
+                        fire = False
+        if fire is None:
+            fire = (target_here or var_here or rel_here
+                    or func_here) and action
+        if not fire and tokens & handle_vars and re.search(
+                r"\.\s*write(?:lines)?\s*\(", line):
+            fire = True
+        if shell and cwd_home and not fire and action and \
+                _AGENT_REL_CONFIG_RE.search(
+                    _normalize_path_text(line.replace("\\", "/"))):
+            fire = True
+        # Fix wave 2 (G5): a tilde-USER path (~admin/.claude/...)
+        # names another account's global config — no home anchor
+        # of the current user's matches it, but a skill writing
+        # there is config poisoning all the same, at CAUTION.
+        tilde_cap = False
+        if not fire and action:
+            tm = re.search(r"~([a-z_][\w-]*)(/[^\s'\";|&]*)", line)
+            if tm and _agent_segment_match(tm.group(2)):
+                fire = True
+                tilde_cap = True
+        if fire and gated:
+            cap = None
+            if demote(start, line) or tilde_cap or (
+                    rel_here and not (target_here or var_here
+                                      or func_here)
+                    and copy is None
+                    and _agent_redirect_pos(line) is None):
+                cap = "caution"
+            add("AGENT_CONFIG_WRITE", rel, start, evidence,
+                severity_cap=cap)
+            hm = re.search(r"\bwith\s+open\s*\([\s\S]*?\)\s+as\s+"
+                           r"([A-Za-z_$][\w$-]*)", line) or re.search(
+                               r"^\s*([A-Za-z_$][\w$-]*)\s*=\s*open\s*\(",
+                               line)
+            if hm:
+                handle_vars.add(hm.group(1))
+        # --- agent credential read --------------------------------
+        acr = False
+        # tar member lists carry their own discipline (an archive
+        # CREATE naming credential members under a home context is a
+        # read of those files) and must not hide behind cred_here:
+        # in a fused shell statement the anchor-to-path gap check
+        # rejects the member run (FP fixture 13).
+        if _tar_cred_read(line, cwd_home):
+            acr = True
+        if cred_here and not acr and not _agent_cred_write_only(line):
+            if copy is not None:
+                acr = _region_has_cred(copy[0], home_vars, part_vars,
+                                       cred_vars)
+            else:
+                acr = _agent_read_action(line, str_vars)
+        if not acr and tokens & (cred_vars | cred_path_vars) and \
+                _AGENT_CRED_USE_RE.search(line):
+            if copy is not None:
+                src_tokens = {m.group() for m in
+                              _AGENT_TOKEN_RE.finditer(copy[0])}
+                acr = bool(src_tokens & (cred_vars | cred_path_vars))
+            else:
+                acr = True
+        if shell and cwd_home and not acr and _agent_read_action(
+                line, str_vars) and _AGENT_REL_CRED_RE.search(
+                    _normalize_path_text(line.replace("\\", "/"))):
+            acr = True
+        # Fix wave 2 (G4): batch `type`/`more` on a credential
+        # path is a read — .bat entered the suffix gate for writes
+        # in the fix wave but its read verb was missing, so the
+        # plain batch shape scanned completely clean.
+        if not acr and suffix in (".bat", ".cmd") and cred_here \
+                and re.search(r"(?:^|[\s;&|])(?:type|more)\s",
+                              line, re.IGNORECASE):
+            acr = True
+        # Fix wave 2 (G4): one-level helper argument flow — a call
+        # passing a credential path to a same-file function whose
+        # body reads that parameter is a read at the call site.
+        if not acr and helper_readers:
+            for fname, rparams in helper_readers.items():
+                order = helper_order.get(fname, [])
+                for hm in re.finditer(
+                        rf"\b{re.escape(fname)}\s*\(", line):
+                    hargs = _call_args(line, hm.end() - 1)
+                    if not hargs:
+                        continue
+                    for ai, harg in enumerate(hargs):
+                        if ai < len(order) and order[ai] in rparams \
+                                and (_agent_credential_in_text(
+                                    harg, home_vars, part_vars)
+                                    or _tokens_present(
+                                        harg, cred_vars)):
+                            acr = True
+                            break
+                    if acr:
+                        break
+                if acr:
+                    break
+        if acr and gated:
+            add("AGENT_CREDENTIAL_READ", rel, start, evidence)
+        # --- variable tracking for later statements ---------------
+        m = _AGENT_ASSIGN_RE.match(line) \
+            or _AGENT_ASSIGN_GO_RE.match(line)
+        if m:
+            var, rhs = m.group(1), m.group(2)
+            was_home = var in home_vars
+            home_vars.discard(var)
+            agent_vars.discard(var)
+            cred_vars.discard(var)
+            config_vars.discard(var)
+            part_vars.pop(var, None)
+            str_vars.pop(var, None)
+            handle_vars.discard(var)
+            rel_targets.discard(var)
+            parent_vars.discard(var)
+            cred_list_vars.discard(var)
+            cred_path_vars.discard(var)
+            if rhs.strip().startswith("[") and any(
+                    _AGENT_CRED_PATH_RE.search(
+                        "/" + it.replace("\\", "/").strip("/").lower())
+                    for it in _quoted_components(rhs)):
+                # The variable ranges over a literal list of
+                # credential paths (FP fixture 08).
+                cred_list_vars.add(var)
+            if rhs.strip()[:1] in "[(" and \
+                    _agent_credential_in_text(rhs, home_vars,
+                                              part_vars):
+                # Fix wave 2 (W5): a list/tuple of PRE-JOINED path
+                # expressions (FP round 2 fixture 06:
+                # STORES = [Path.home()/".claude"/".credentials"
+                # ".json", ...]) — iterating or copying its
+                # elements is credential access, exactly like the
+                # fragment-list shape above.
+                cred_path_vars.add(var)
+            compact_rhs = _agent_compact(rhs)
+            if _AGENT_HOME_ANCHOR_RE.search(compact_rhs) \
+                    or _tokens_present(rhs, home_vars) \
+                    or (was_home and var in
+                        {t.group() for t in
+                         _AGENT_TOKEN_RE.finditer(rhs)}):
+                home_vars.add(var)
+            comps = "/".join(
+                c.replace("\\", "/").strip("/").lower()
+                for c in _quoted_components(rhs))
+            if comps and (_agent_segment_match("/" + comps)
+                          or _AGENT_CRED_PATH_RE.search("/" + comps)):
+                part_vars[var] = comps
+            if target_here or _tokens_present(rhs, agent_vars):
+                agent_vars.add(var)
+            if cred_here:
+                cred_vars.add(var)
+            if var in home_vars and (
+                    "xdg_config_home" in compact_rhs
+                    or comps == ".config"
+                    or comps.endswith("/.config")):
+                config_vars.add(var)
+            sm = re.fullmatch(r"(['\"])((?:\\.|(?!\1).)*)\1",
+                              rhs.strip(), re.DOTALL)
+            if sm:
+                str_vars[var] = sm.group(2)
+            has_chain = "__file__" in rhs and (
+                rhs.count(".parent") >= 2 or ".parents[" in rhs)
+            if has_chain:
+                parent_vars.add(var)
+            if (_tokens_present(rhs, parent_vars) or has_chain) and \
+                    any(fn in rhs.lower()
+                        for fn in _AGENT_CONFIG_FILE_NAMES):
+                rel_targets.add(var)
+        else:
+            fm = re.match(r"^\s*for\s+([A-Za-z_$][\w$-]*)\s+in\s+"
+                          r"\[(.*)\]", line, re.DOTALL)
+            if fm and any(
+                    _AGENT_CRED_PATH_RE.search(
+                        "/" + it.replace("\\", "/").strip("/").lower())
+                    for it in _quoted_components(fm.group(2))):
+                cred_list_vars.add(fm.group(1))
+            fm2 = re.match(r"^\s*for\s+([A-Za-z_$][\w$-]*)\s+in\s+"
+                           r"([A-Za-z_$][\w$-]*)\b", line)
+            if fm2 and fm2.group(2) in cred_path_vars:
+                # W5: the loop variable ranges over pre-joined
+                # credential paths; it IS a credential variable.
+                cred_vars.add(fm2.group(1))
+            if fm2 and fm2.group(2) in cred_list_vars:
+                # Same one-level flow for a NAMED credential-path
+                # list: the loop variable ranges over credential
+                # path strings (audit round 2 R2-F3's fixture
+                # uses the literal form; the named form must not
+                # be the hole next to it).
+                cred_list_vars.add(fm2.group(1))
+            mm = re.match(r"^\s*([A-Za-z_$][\w$-]*)\s*\.\s*"
+                          r"(?:push|append|join)\s*\(", line)
+            if mm and mm.group(1) in home_vars:
+                comps = _comps_join(line)
+                if comps and _agent_segment_match("/" + comps.lower()):
+                    agent_vars.add(mm.group(1))
+                elif comps and _AGENT_CRED_PATH_RE.search(
+                        "/" + comps.lower()):
+                    cred_vars.add(mm.group(1))
+
+
+_AGENT_PROSE_WRITE_RE = re.compile(
+    r"\b(?:add|adds|append|appends|write|writes|paste|copy|place|"
+    r"insert|edit|edits|update|updates|modify|create|register|"
+    r"install|save|replace|set\s+up)\b", re.IGNORECASE)
+_AGENT_PROSE_PROHIBITED_RE = re.compile(
+    r"\b(?:never|do not|don't|must not|should not)\b"
+    r"[^.!?\n]{0,80}?\b(?:allow|let|permit|instruct|tell|ask)\b",
+    re.IGNORECASE)
+_AGENT_PROSE_ACCESS_RE = re.compile(
+    r"\b(?:open|read|cat|print|show|copy|upload|send|paste|reveal|"
+    r"display|load|fetch)\b", re.IGNORECASE)
+_AGENT_PROSE_SEND_RE = re.compile(
+    r"\b(?:upload|send|post|share|email|forward)\b", re.IGNORECASE)
+_AGENT_PROSE_DEST_RE = re.compile(
+    r"https?://|[\w.+-]+@[\w-]+\.[\w.]+|webhook|\bexternal\b",
+    re.IGNORECASE)
+_AGENT_SENTENCE_NEG_RE = re.compile(
+    r"\b(?:never|do not|don't|must not|should not|not)\b", re.IGNORECASE)
+# Example/reference framing: a quoted component pair INTRODUCED as
+# an example ("the pair '.claude', 'settings.json' names the file,
+# shown here as an example of its layout") is a mention, not a path
+# construction (audit t10/t12).
+_AGENT_PROSE_FRAMING_RE = re.compile(
+    r"\b(?:example|for reference|pair|layout|shown|illustrat\w*|"
+    r"sample)\b", re.IGNORECASE)
+
+
+def _load_agent_prose_write_verbs() -> re.Pattern | None:
+    """Non-English config-write verbs for the prose matcher, loaded
+    from the phrase files (the NON_ENGLISH_INSTRUCTION pattern: one
+    data file per language; `config_write` verb list). Spanish
+    ships in this wave (rt36); other languages join by adding the
+    key to their phrase file."""
+    try:
+        import json as _json
+        data = _json.loads(
+            (Path(__file__).parent / "phrases" / "es.json").read_text(
+                encoding="utf-8"))
+        verbs = [str(v) for v in data.get("config_write", ())]
+    except Exception:
+        return None
+    if not verbs:
+        return None
+    return re.compile(
+        r"\b(?:" + "|".join(re.escape(v) for v in verbs) + r")\b",
+        re.IGNORECASE)
+
+
+_AGENT_PROSE_WRITE_ES_RE = _load_agent_prose_write_verbs()
+
+
+def _agent_sentence_negated(sentence: str) -> bool:
+    """Sentence-scope negation (audit F7/F10): an English negation
+    or prohibition frame, or a negation word from the phrase-file
+    languages, governs ITS OWN sentence only."""
+    if _AGENT_SENTENCE_NEG_RE.search(sentence) \
+            or _AGENT_PROSE_PROHIBITED_RE.search(sentence):
+        return True
+    low = sentence.lower()
+    return any(neg in low for neg in _NON_ENGLISH_NEGATIONS)
+
+
+def _agent_sentences(block: str) -> list[tuple[int, str]]:
+    """Sentence spans of a joined block. A split needs [.!?] +
+    whitespace + a capital/digit, so the dots inside paths and URLs
+    (auth.json, example.invalid) never truncate a sentence."""
+    out: list[tuple[int, str]] = []
+    start = 0
+    for m in re.finditer(r"[.!?]\s+(?=[A-Z0-9])", block):
+        out.append((start, block[start:m.start() + 1]))
+        start = m.end()
+    out.append((start, block[start:]))
+    return out
+
+
+_AGENT_LIST_LINE_RE = re.compile(r"^(?:[-*+]|\d+[.)]|#{1,6}\s|>|```)")
+
+
+def _agent_prose_units(block: str, spans) -> list[tuple[int, str]]:
+    """Instruction units of a joined block: each list item, heading
+    or fence line is its own unit (markdown structure is sentence
+    structure there — joining bullets lets a verb in one bullet
+    meet a target in another), while plain prose lines join so a
+    hard-wrapped sentence stays whole. Yields (offset, unit)."""
+    units: list[tuple[int, str]] = []
+    cur_off = 0
+    cur: str | None = None
+    for i, (off, _ln) in enumerate(spans):
+        end = spans[i + 1][0] - 1 if i + 1 < len(spans) else len(block)
+        seg = block[off:end]
+        if _AGENT_LIST_LINE_RE.match(seg.strip()):
+            if cur is not None:
+                units.append((cur_off, cur))
+                cur = None
+            units.append((off, seg))
+        elif cur is None:
+            cur_off, cur = off, seg
+        else:
+            cur = cur + " " + seg
+    if cur is not None:
+        units.append((cur_off, cur))
+    return units
+
+
+def _agent_target_spans(text: str) -> list[tuple[int, int, bool]]:
+    """Target spans (start, end, from_components) in text
+    coordinates. Anchor spans come from a home anchor whose
+    remainder classifies. Component spans come from QUOTED
+    component groups in list/join form only — consecutive quoted
+    strings separated by nothing but commas/brackets — so a pair
+    joined by 'and' in running prose is a mention, not a path
+    (audit t12), while the parts-list form ('.claude',
+    'settings.json') is a construction (audit t11)."""
+    spans: list[tuple[int, int, bool]] = []
+    low = _normalize_path_text(text.replace("\\", "/").lower())
+    for m in _AGENT_HOME_ANCHOR_RE.finditer(low):
+        cfg = "xdg_config_home" in m.group()
+        rem = _agent_remainder_after_anchor(
+            _agent_compact(low[m.end():m.end() + 200]), 0)
+        if _agent_segment_match(rem) or (
+                cfg and _agent_segment_match("/.config" + rem)):
+            spans.append((m.start(), min(len(text), m.start() + 80),
+                          False))
+    qs = [(m.start(), m.end(), m.group(1)) for m in
+          re.finditer(r"['\"`]([^'\"`]+)['\"`]", text)]
+    i = 0
+    while i < len(qs):
+        group = [qs[i]]
+        j = i
+        while j + 1 < len(qs):
+            between = text[group[-1][1]:qs[j + 1][0]]
+            if re.fullmatch(r"[\s,\[\]()+/]*", between):
+                group.append(qs[j + 1])
+                j += 1
+            else:
+                break
+        if len(group) >= 2:
+            joined = "/".join(
+                g[2].replace("\\", "/").strip("/").lower()
+                for g in group)
+            if _agent_segment_match("/" + joined):
+                spans.append((group[0][0], group[-1][1], True))
+        i = j + 1
+    return spans
+
+
+def _agent_write_hit(text: str, framing_at=None) -> int | None:
+    """Offset of a target span when a config-write verb sits within
+    100 chars OF THE TARGET (audit F8 — the pre-fix code measured
+    verb-to-anchor, missing t11 and false-firing t12), else None.
+    `framing_at(pos)` suppresses component spans sitting in
+    example/reference framing."""
+    spans = _agent_target_spans(text)
+    if not spans:
+        return None
+    low = text.lower()
+    verbs = [(m.start(), m.end())
+             for m in _AGENT_PROSE_WRITE_RE.finditer(low)]
+    if _AGENT_PROSE_WRITE_ES_RE is not None:
+        verbs += [(m.start(), m.end()) for m in
+                  _AGENT_PROSE_WRITE_ES_RE.finditer(low)]
+    if not verbs:
+        return None
+    for s, e, from_comp in spans:
+        if from_comp and framing_at is not None and framing_at(s):
+            continue
+        for vs, ve in verbs:
+            if max(s - ve, vs - e, 0) <= 100:
+                return s
+    return None
+
+
+def _agent_doc_command_findings(rel: str, lines: list[str],
+                                add) -> None:
+    """Command surfaces inside documentation judge as CODE for
+    detection (rt39/rt48): lines inside code fences, and
+    command-valued lines in data-style docs (run:/command:/...
+    keys). A fenced `cat payload >> ~/.claude/CLAUDE.md` is a
+    command the agent is told to run, not prose about one. Tier
+    stays CAUTION — the doc surface discipline."""
+    in_fence = False
+    for lineno, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and not _AGENT_DOC_CMDKEY_RE.search(line):
+            continue
+        if _agent_target_in_text(line) and _agent_write_action(line):
+            add("AGENT_CONFIG_WRITE", rel, lineno, line,
+                severity_cap="caution")
+        elif _agent_credential_in_text(line) and _agent_read_action(
+                line):
+            add("AGENT_CREDENTIAL_READ", rel, lineno, line,
+                severity_cap="caution")
+
+
+def _agent_config_doc_findings(rel: str, path: Path, lines: list[str],
+                               add) -> None:
+    """Prose half. Documentation is visible and user-mediated, so
+    every prose finding here is CAUTION — including instructions to
+    paste a config change into a global file yourself. Mere
+    discussion (no write verb), safety warnings, and a config
+    EXAMPLE with no global target do not fire."""
+    _agent_doc_command_findings(rel, lines, add)
+    for _start, block, spans in _text_blocks(lines):
+        # --- global config write, instructed in prose -------------
+        # Judged per sentence inside per-structure units, with the
+        # prohibition/negation scope limited to its own sentence
+        # (audit F7: one warning sentence must not inoculate a
+        # whole paragraph) and proximity measured verb-to-target
+        # (audit F8). When verb and target split across sentences
+        # of one unit, the unit is judged whole as a fallback.
+        fired = False
+        for uoff, unit in _agent_prose_units(block, spans):
+            if fired:
+                break
+            unit_sents = _agent_sentences(unit)
+            for soff, sentence in unit_sents:
+                if _agent_sentence_negated(sentence):
+                    continue
+                hit = _agent_write_hit(
+                    sentence,
+                    framing_at=lambda p, s=sentence: bool(
+                        _AGENT_PROSE_FRAMING_RE.search(s)))
+                if hit is not None:
+                    add("AGENT_CONFIG_WRITE", rel,
+                        _block_line(spans, uoff + soff + hit),
+                        block[:160], severity_cap="caution")
+                    fired = True
+                    break
+            if fired:
+                break
+            live = [(soff, s) for soff, s in unit_sents
+                    if not _agent_sentence_negated(s)]
+            if len(live) >= 2:
+                joined = " ".join(s for _o, s in live)
+                segs: list[tuple[int, int, str]] = []
+                acc = 0
+                for soff, s in live:
+                    segs.append((acc, soff, s))
+                    acc += len(s) + 1
+
+                def framing_at(p, segs=segs):
+                    for js, _uo, s in reversed(segs):
+                        if p >= js:
+                            return bool(
+                                _AGENT_PROSE_FRAMING_RE.search(s))
+                    return False
+
+                hit = _agent_write_hit(joined, framing_at=framing_at)
+                if hit is not None:
+                    uoff_hit = hit
+                    for js, uo, _s in segs:
+                        if hit >= js:
+                            uoff_hit = uo + (hit - js)
+                    add("AGENT_CONFIG_WRITE", rel,
+                        _block_line(spans, uoff + uoff_hit),
+                        block[:160], severity_cap="caution")
+                    fired = True
+        # --- agent credential read, instructed in prose -----------
+        cred_line: int | None = None
+        send_found = False
+        for off, sentence in _agent_sentences(block):
+            if _agent_sentence_negated(sentence):
+                continue  # a prohibition governs its own sentence
+            if cred_line is None \
+                    and _agent_credential_in_text(sentence) \
+                    and _AGENT_PROSE_ACCESS_RE.search(sentence):
+                cred_line = _block_line(spans, off)
+            if _AGENT_PROSE_SEND_RE.search(sentence) \
+                    and _AGENT_PROSE_DEST_RE.search(sentence):
+                send_found = True
+        if cred_line is not None:
+            add("AGENT_CREDENTIAL_READ", rel, cred_line, block[:160],
+                severity_cap="caution")
+            if send_found:
+                # Prose read + prose send to an outside destination
+                # is the exfiltration shape performed by the agent.
+                add("EXFIL_COMBINATION", rel, cred_line,
+                    block[:160])
+
+
+def _agent_config_findings(rel: str, path: Path, text: str,
+                           lines: list[str], scan_lines: list[str],
+                           doc: bool, add, comment_spans: dict,
+                           string_spans: dict) -> None:
+    if doc:
+        _agent_config_doc_findings(rel, path, lines, add)
+    else:
+        _agent_config_code_findings(rel, path, scan_lines, lines, add,
+                                    comment_spans, string_spans)
+
+
 def scan_folder(root: Path) -> ScanResult:
     root = root.resolve()
     result = ScanResult(target=str(root))
@@ -5103,6 +7520,9 @@ def scan_folder(root: Path) -> ScanResult:
                               note=result.skipped.append)
             _dependency_findings(rel, path, text, lines, add)
             _typosquat_findings(rel, path, text, lines, add)
+            _agent_config_findings(rel, path, text, lines, scan_lines,
+                                   doc, add, comment_spans,
+                                   string_spans)
             if suffix in (".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx"):
                 # Comment-blanked text: a fetch word in a comment is
                 # not fetch evidence (audit F5).

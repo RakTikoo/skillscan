@@ -32,6 +32,8 @@ class Rule:
 # MCP codes are the OWASP MCP Top 10.
 _OWASP_MAP: dict[str, str] = {
     "SSH_CREDENTIAL_READ": "LLM02, MCP01",
+    "AGENT_CREDENTIAL_READ": "LLM02, MCP01",
+    "AGENT_CONFIG_WRITE": "LLM06, MCP02, MCP05",
     "CLOUD_CREDENTIAL_READ": "LLM02, MCP01",
     "ENV_FILE_READ": "LLM02, MCP01",
     "ENVIRON_SECRET_ACCESS": "LLM02, MCP01",
@@ -127,6 +129,31 @@ RULES: list[Rule] = [
         "Reads SSH credential material (~/.ssh / private key files). A skill "
         "has no legitimate reason to read your SSH keys.",
         r"(\.ssh\b|id_rsa|id_ed25519|id_ecdsa|id_dsa)",
+    ),
+    _rule(
+        "AGENT_CREDENTIAL_READ", "block",
+        "Reads an AI agent's own stored sign-in credentials (for "
+        "example ~/.claude/.credentials.json, ~/.codex/auth.json, or a "
+        "Gemini/OpenCode auth store). Those files hand over the user's "
+        "agent-account session, and a skill has no ordinary reason to "
+        "read them. It counts as credential material for "
+        "EXFIL_COMBINATION, like an SSH key read.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "AGENT_CONFIG_WRITE", "block",
+        "Writes, appends, copies or registers configuration into a "
+        "GLOBAL AI-agent configuration location outside the skill's "
+        "own folder (for example ~/.claude/CLAUDE.md, ~/.claude "
+        "settings or SessionStart hooks, ~/.codex configuration, a "
+        "desktop app's MCP config, or global editor/agent rules). "
+        "That silently changes what the user's agent does in every "
+        "future session, not just while this skill runs. A skill's own "
+        "project-local .claude/.codex/.mcp files are not this rule. "
+        "Documentation that tells the user to make the same change "
+        "themselves, visibly, is the same location at CAUTION — "
+        "user-mediated, not silent.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
     ),
     _rule(
         "CLOUD_CREDENTIAL_READ", "block",
@@ -648,5 +675,6 @@ FILE_LEVEL_RULE_IDS = {
     "OUTPUT_MANIPULATION", "PROSE_INSTRUCTION_EN", "PROSE_FETCH_EXECUTE",
     "PROSE_PIPE_INSTRUCTION", "PROSE_READ_SEND", "PROSE_SAFETY_BYPASS",
     "LURE_WITH_BYPASS", "TAINTED_SEND", "SECRET_FLOW", "TYPOSQUAT_SUSPECT",
+    "AGENT_CONFIG_WRITE", "AGENT_CREDENTIAL_READ",
 }
 LINE_RULES = [r for r in RULES if r.id not in FILE_LEVEL_RULE_IDS]
