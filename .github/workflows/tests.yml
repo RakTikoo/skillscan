@@ -32,3 +32,7 @@ jobs:
         run: python3 run_v02_tests.py
       - name: v0.3 features (hidden text, non-English phrases, concealment, sessions, bytecode honesty, env injection, OWASP)
         run: python3 run_v03_tests.py
+      - name: v0.4 features (dependency sources, JS download-and-run, install prose, prose chains, read-and-disclose)
+        run: python3 run_v04_tests.py
+      - name: v0.4 fix pass (DoS perf, inert-text precision, lifecycle scoping, review evasions)
+        run: python3 run_v04fix_tests.py
