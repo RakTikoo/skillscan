@@ -36,3 +36,7 @@ jobs:
         run: python3 run_v04_tests.py
       - name: v0.4 fix pass (DoS perf, inert-text precision, lifecycle scoping, review evasions)
         run: python3 run_v04fix_tests.py
+      - name: v0.5 features (prose chains, output manipulation, taint-lite, typosquat gate)
+        run: python3 run_v05_tests.py
+      - name: v0.5 fix pass (taint scope/flow, lure proximity, guard laundering, typosquat extraction)
+        run: python3 run_v05fix_tests.py
