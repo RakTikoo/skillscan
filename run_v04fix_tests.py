@@ -89,7 +89,7 @@ def main() -> int:
 
     sys.path.insert(0, str(ROOT))
     import skillscan
-    check("version-stays-0.4.0", skillscan.__version__ == "0.4.0",
+    check("version-is-0.5.0", skillscan.__version__ == "0.5.0",
           skillscan.__version__)
 
     with tempfile.TemporaryDirectory() as tmp:
