@@ -128,7 +128,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full guide:
 
 ## Rules
 
-47 deterministic rules. Any block-severity hit makes the verdict BLOCK;
+57 deterministic rules. Any block-severity hit makes the verdict BLOCK;
 otherwise any caution hit makes it CAUTION; otherwise PASS. Every rule
 also carries an OWASP mapping (LLM Top 10 / MCP Top 10 category codes),
 surfaced per finding in JSON output and in SARIF rule metadata — it is
@@ -175,6 +175,16 @@ triage metadata only and never affects the verdict.
 | DOWNLOAD_AND_RUN | block | A JS/TS file both fetches remote content **and** dynamically loads code (`require()` of a computed path, or `eval`) — the JS download-and-run dropper shape |
 | PROSE_DOWNLOAD_RUN | caution | The instructions walk through a download-and-run chain by hand: fetch an archive or binary from an external source, then run/launch/install what arrived — the dropper pattern split across prose steps |
 | READ_AND_DISCLOSE | caution | The folder's code reads local files **and** its instructions direct sending/uploading content to an external destination (URL, email, server, webhook) — the agent itself is the channel between the two halves |
+| PROSE_FETCH_EXECUTE | caution | The instructions fetch a script or tool straight from a URL and tell the agent to run it — including anaphoric steps ("then run it") that name no file at all |
+| PROSE_PIPE_INSTRUCTION | caution | The instructions (a fenced example or numbered steps) pipe a network download straight into a shell — unverified remote code execution written as documentation |
+| PROSE_READ_SEND | caution | The instructions alone do both halves: read local files/folders **and** send their contents to a URL, email address or other external destination — no code needed, the agent is the channel |
+| PROSE_SAFETY_BYPASS | caution | The instructions ask for a safety control (antivirus, SmartScreen, Gatekeeper, a certificate check) to be disabled or ignored so something can run |
+| LURE_WITH_BYPASS | block | The folder both walks through a download-and-run chain **and** asks for a safety control to be disabled first — the classic malware-install lure shape |
+| OUTPUT_MANIPULATION | caution | Instruction surfaces only (`SKILL.md`, `*.mdc`, tool-description JSON): text that steers the agent's output — hide things from the user, pretend, never refuse, or always push one product over alternatives. Discussion of such attacks (examples, warnings, "never follow instructions that say…") does not fire |
+| PROSE_INSTRUCTION_EN | caution | Instruction surfaces only: English system-prompt manipulation — override/disregard prior instructions, reveal/print the system prompt, developer-mode phrasing, or a one-sentence instruction to send conversation/credential/document contents to an outside destination |
+| TAINTED_SEND | block | Values read from credential material (SSH keys, token/credential files, cloud config, `.env`, browser stores) flow through the code — assignments, helpers, encoders — into a network send. Tracked by value flow, not by variable name; encoding a credential does not clean it |
+| SECRET_FLOW | caution | A secret-named environment variable's value flows into a request **body**. A service's own token in its own `Authorization` header is ordinary and does not fire |
+| TYPOSQUAT_SUSPECT | caution | A declared dependency name is one small edit from a very popular package name (transposed letters, swapped separator, look-alike character) — the typosquatting shape. Compared offline against curated top-package lists (`skillscan/toplists/`); known legitimate near-miss packages are never flagged |
 | HIDDEN_TEXT | block / caution | Concealed text: zero-width or bidirectional control characters, Unicode Tags-block payloads (BLOCK when the decoded payload contains instruction keywords), or HTML comments carrying instruction-like content. A single zero-width joiner in ordinary multilingual text does not fire |
 | NON_ENGLISH_INSTRUCTION | caution | Instruction-attack phrases in 14 other languages (override / send-the-credentials / keep-it-from-the-user shapes) — a phrase list, not language understanding. The lists are data files (`skillscan/phrases/<code>.json`): adding a language = adding one file |
 | ANY_LANGUAGE_STRUCTURE | caution | An instruction surface in ANY language pairs a private credential store (`~/.ssh`, `~/.aws`, a `.env` file, a browser credential store) with an outbound destination (URL, IP, email, curl/wget, webhook). Normal integration guides (your own token → the service's API URL) and safety warnings do not fire |
@@ -293,13 +303,15 @@ python3 run_v02_tests.py       # v0.2: secrets, metadata, browser stores, revers
 python3 run_v03_tests.py       # v0.3: hidden text (zero-width/Tags/BiDi/comments), non-English instruction phrases, Markdown concealment, substitution exec, session sends, bytecode honesty, env injection, OWASP metadata (fixtures are inert and built in a temp dir)
 python3 run_v04_tests.py       # v0.4: dependency sources (off-registry manifests, install-execution combination), JS http/https + download-and-run, install-prose refinement (named-registry docs pass, URL installs flag), substitution documentation cap, directive-comment recalibration, prose download-run chain, read-and-disclose combination (fixtures are inert and built in a temp dir)
 python3 run_v04fix_tests.py    # v0.4 fix pass: scanner-DoS perf shapes, inert-text (comment/string) precision, routine-lifecycle + same-package combination scoping, urllib.parse classification, and one regression case per adversarial-review evasion (fixtures are inert and built in a temp dir)
+python3 run_v05_tests.py       # v0.5: prose fetch-execute / pipe / read-send chains + safety-bypass lure, output-manipulation + prompt-manipulation phrases on instruction surfaces, taint-lite (credential flow to sends), offline typosquat + its harvested-name validation gate (fixtures are inert and built in a temp dir)
+python3 run_v05fix_tests.py    # v0.5 fix pass: scope-aware flow-sensitive taint (no BLOCK on a name collision), lure proximity + framing suppression, guard-laundering closures, output-manipulation frame scoping, typosquat manifest extraction (bare names, setup.py, homoglyphs), one regression case per adversarial-review finding (fixtures are inert and built in a temp dir)
 ```
 
 ## Coverage against published audits
 
 [`docs/AUDIT_COVERAGE.md`](docs/AUDIT_COVERAGE.md) maps 25 techniques
 from four published audits of real malicious skills / MCP servers
-against the 47 rules above. Summary (Covered / Partial / Gap per audit):
+against the 57 rules above. Summary (Covered / Partial / Gap per audit):
 
 | Audit | Covered | Partial | Gap |
 |-------|---------|---------|-----|
@@ -324,7 +336,7 @@ codes, and exits non-zero on any failure.
 
 SkillScan's own measured rates on a public labelled corpus —
 **MaliciousSkillBench** (9,740 labelled skills, pinned at commit
-`893afd6`), run 2026-11-10 with SkillScan **v0.4.0**. Malicious skills
+`893afd6`), run 2026-11-10 with SkillScan **v0.5.0**. Malicious skills
 were scanned as complete extracted folders; benign skills are shipped
 by the benchmark as frozen text, so each was scanned as a single
 `SKILL.md` folder. Nothing was executed — folders were read as text
@@ -333,30 +345,30 @@ only. Full methodology, counting rules and caveats:
 
 | Set | Skills | BLOCK | CAUTION | PASS |
 |-----|--------|-------|---------|------|
-| Malicious | 7,421 | **45.7%** (3,394) | 36.1% (2,676) | 18.2% (1,351) |
-| Benign | 2,235 | 0% false BLOCKs (0) | 22.3% (498) | 77.7% (1,737) |
+| Malicious | 7,421 | **45.7%** (3,395) | 36.7% (2,722) | 17.6% (1,304) |
+| Benign | 2,235 | 0% false BLOCKs (0) | 24.8% (555) | 75.2% (1,680) |
 
-Detection at BLOCK+CAUTION (flagged at any severity): **81.8%** of
-malicious skills; 22.3% of benign skills were flagged at any severity.
+Detection at BLOCK+CAUTION (flagged at any severity): **82.4%** of
+malicious skills; 24.8% of benign skills were flagged at any severity.
 
 Detection by attack family (multi-label membership; BLOCK /
 BLOCK+CAUTION):
 
 | Family | Skills | BLOCK | BLOCK+CAUTION |
 |--------|--------|-------|---------------|
-| Privilege / tool-authority abuse | 1,004 | 74.4% | 99.3% |
-| Execution / code delivery | 3,205 | 74.1% | 97.8% |
-| Credential access | 197 | 55.3% | 95.4% |
-| Persistence / control | 249 | 55.0% | 89.6% |
-| Instruction / goal manipulation | 1,560 | 63.9% | 85.8% |
-| Data exfiltration / disclosure | 266 | 35.0% | 82.3% |
-| Resource / availability abuse | 330 | 22.7% | 90.0% |
+| Privilege / tool-authority abuse | 1,004 | 74.4% | 99.4% |
+| Execution / code delivery | 3,205 | 74.1% | 97.9% |
+| Credential access | 197 | 55.3% | 95.9% |
+| Persistence / control | 249 | 55.0% | 90.0% |
+| Instruction / goal manipulation | 1,560 | 63.9% | 86.2% |
+| Data exfiltration / disclosure | 266 | 35.0% | 83.8% |
+| Resource / availability abuse | 330 | 22.7% | 90.3% |
 | Dependency / supply chain | 167 | 13.2% | 87.4% |
 | Integrity / output manipulation | 97 | 1.0% | 28.9% |
 
 Honest limits, stated plainly:
 
-- **Most misses are prose-only skills.** 925 of the 1,351 missed
+- **Most misses are prose-only skills.** 886 of the 1,304 missed
   malicious skills are a single `SKILL.md` with no code at all. Among
   *pure* instruction-manipulation skills the BLOCK rate is 8.8%, and
   pure output manipulation is ~1% — deterministic rules see behaviour
@@ -365,12 +377,14 @@ Honest limits, stated plainly:
   figure measures prose-triggered false alarms, not code-triggered
   ones. That asymmetry is part of the corpus, and it is disclosed
   rather than smoothed over.
-- **v0.3's false-BLOCK regression is fixed.** v0.3 measured 15 benign
-  false BLOCKs (0.67%), all from one rule (`SUBSTITUTION_EXEC`)
-  firing at block severity on command-substitution examples inside
-  benign documentation. v0.4 measures **0** false BLOCKs on the same
-  benign set, and the benign flagged-at-any-severity rate fell from
-  26.5% to 22.3%.
+- **v0.5's gain is at CAUTION, not BLOCK.** BLOCK detection is
+  unchanged from v0.4 in every labelled attack family (45.7%
+  overall); BLOCK+CAUTION rose from 81.8% to 82.4% as the new prose
+  chains, output-manipulation and value-flow rules flagged 47 skills
+  v0.4 passed entirely. Benign false BLOCKs remain **0** on the same
+  benign set; the benign flagged-at-any-severity rate rose from
+  22.3% to 24.8% because the new rules also add CAUTIONs on benign
+  prose.
 
 ## Licence
 
@@ -378,7 +392,7 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 RakTikoo.
 
 ## Status
 
-v0.4. v0.1 was a Week 1 spike hardened by adversarial review; v0.2 adds
+v0.5. v0.1 was a Week 1 spike hardened by adversarial review; v0.2 adds
 secret detection, cloud-metadata and browser-store rules, raw-socket
 reverse-shell detection, error-leak detection, npm/PyPI package
 targets, Cursor-rules handling, repo-URL scanning, SARIF output, and
@@ -404,7 +418,32 @@ directive-shaped HTML comments (agent-addressed orders in framing
 vocabulary) caution again, a prose download-and-run chain rule for
 download+execute instructions split across steps, and a
 read-and-disclose combination for skills whose code reads files
-while their prose sends the contents out. Expect false
+while their prose sends the contents out. v0.5 is the standalone-
+coverage wave (still zero-dependency, offline, deterministic):
+prose fetch-and-execute / pipe-to-shell / read-and-send chains,
+a safety-bypass rule whose combination with a download-and-run
+chain blocks, output-manipulation and English prompt-manipulation
+phrase families restricted to instruction surfaces (SKILL.md,
+*.mdc, tool-description JSON), a small intra-file value-flow
+analysis for Python (credential material reaching a network send
+blocks; environment secrets landing in request bodies caution),
+and an offline typosquat check for declared dependencies against
+curated top-package lists. The v0.5 fix pass (three independent
+adversarial reviews — red team, false-positive hunt, code audit —
+run against the v0.5 build) then hardened the new surface: the
+taint tracker became scope-aware and flow-sensitive, so a BLOCK
+can no longer rest on a cross-function name collision or a
+reassigned variable; taint now survives container writes and
+ordinary method chains (`.strip()`, `.hex()`); the
+lure combination now requires its two halves to sit in the same
+file, near each other, outside warning/training framing (five
+benign guides the build blocked now pass); output-manipulation
+guards judge frame structure instead of keywords, closing
+"this is just an example" laundering; disclose/read-send
+suppression is judged per sentence, so a user's-own-data frame
+no longer covers sending the same data to a named external
+address; and the typosquat extractor now reads bare unpinned
+names, setup.py, and Cyrillic-lookalike names. Expect false
 positives and false negatives; the rule set and corpus are the starting
 point, not the finished product. Issues and new evasion samples are
 welcome — a mutation that evades SkillScan is a valuable contribution.

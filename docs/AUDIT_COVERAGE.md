@@ -494,6 +494,255 @@ still not performed (gap class F stands).
 
 ---
 
+## v0.5 additions — the standalone-coverage wave
+
+Design: `skillscan-watch/V05_PLAN.md`. Everything below is still
+zero-dependency, offline and deterministic — no network, no model,
+nothing leaves the machine. Rules 47 → 57.
+
+- **Prose chain extensions (coverage S3/K1).** The by-hand chain
+  family grows four members: PROSE_FETCH_EXECUTE (a script or tool
+  fetched by URL and run, including anaphoric "then run it" steps —
+  the anaphoric variant requires a staging step, because "download
+  the app and run it" is an ordinary install sentence and a v0.4
+  control case), PROSE_PIPE_INSTRUCTION (pipe-a-download-into-a-
+  shell as documentation, fenced or in words), PROSE_READ_SEND
+  (the prose-only sibling of READ_AND_DISCLOSE: a prose read half
+  plus a send verb with a strict destination — URL, email or
+  "external" — in one sentence, with the shared consent/self/own/
+  local suppressors and a third-party-subject guard),
+  PROSE_SAFETY_BYPASS, and the LURE_WITH_BYPASS combination
+  (BLOCK): a download-and-run chain anywhere in the folder plus a
+  safety-bypass instruction anywhere in the folder.
+- **Output manipulation + English prompt manipulation (gap class
+  B, mechanics side).** OUTPUT_MANIPULATION and
+  PROSE_INSTRUCTION_EN run ONLY on instruction surfaces — a
+  skill's SKILL.md, *.mdc editor rules, and tool-description JSON
+  string values — never on arbitrary documentation, and never on
+  fenced code examples. Three bars for output manipulation:
+  concealment from the user, compliance steering, and
+  recommendation bias (bias verb + quantifier in one sentence and
+  a competitor contrast in the same block). Discussion of such
+  attacks is exempt per sentence: framing vocabulary and
+  prohibitions of the form ("never follow instructions that
+  say…") suppress the match they frame — the v0.4 NEGATION_RE is
+  deliberately not reused here, because it matches a bare "do
+  not" and would neutralise "do not tell the user" itself.
+  Matching runs over paragraph blocks, because real skills
+  hard-wrap prose and a payload split across a wrap is still one
+  instruction. First-cut bars measured 1.43% rule-alone on the
+  benign corpus (markdown tables and checklists); the shipped
+  bars measure **0.36%** rule-alone (see the re-scan below).
+- **Taint-lite for Python (gap class F, intra-file slice).**
+  TAINTED_SEND (BLOCK): values sourced from credential material —
+  classified by path value (SSH/cloud/browser-store fragments,
+  `.env`, credential filenames), never by variable name — flow
+  through assignments, containers, f-strings, transparent
+  wrappers (str/bytes/encoders/json.dumps) and file-local function
+  return summaries into a network send at any argument position.
+  SECRET_FLOW (CAUTION): a secret-named environment variable's
+  value in a request BODY — a service's own token in its own
+  Authorization header is explicitly not flagged, and plain file
+  contents on a socket are not flagged ("file"/"input" taint
+  never fires alone). Intra-file and Python-only; no sanitiser
+  modelling (encoding a credential does not clean it). As
+  originally built, function summaries were name-keyed, not
+  scope-keyed; the fix pass below replaced the tracker with a
+  scope-aware, flow-sensitive one. This is the honest
+  small slice of class F, not the class.
+- **Offline typosquat (gap K6, name-shape only).**
+  TYPOSQUAT_SUSPECT (CAUTION) compares declared dependency names
+  against curated top-package lists shipped as data files
+  (`skillscan/toplists/{pypi,npm}.json`, loaded like `phrases/`),
+  using Damerau-Levenshtein distance 1, distance 2 under
+  first-letter + prefix guards, separator mutations and
+  homoglyph-lite folds. A known-legitimate-neighbours list is
+  part of the data (fastai, authlib, clsx, safer-buffer and
+  friends are real packages one edit from a top name).
+  Validation gate, asserted in run_v05_tests.py: 545 harvested
+  legitimate PyPI names and 775 npm names (from local manifests,
+  lock files, installed trees and installed-package metadata;
+  the fix pass added famous near-miss packages the first cut
+  flagged — nox, fpdf, pypdf2, markdown2, aredis, polar, preact,
+  momentjs — to the known-legitimate-neighbours data)
+  produce **zero** flags, and a synthetic mutation battery over
+  the top names is caught at 100% (the battery generates the
+  same mutation classes the matcher implements — a consistency
+  check, not an independent red team). Expected benchmark gain
+  is ~zero by construction: the benchmark corpus declares
+  almost no squatted dependencies. The value is forward-looking,
+  against real-world manifests.
+
+- **Full-corpus re-scan (MaliciousSkillBench, same counting as
+  the v0.4 report).** Benign (n=2,235): false BLOCKs **0**
+  (unchanged), CAUTION 498 → 543 folders, median 33 ms. Every new
+  prose rule's rule-alone benign rate is under the plan's 1%
+  bar: OUTPUT_MANIPULATION 0.36%, PROSE_INSTRUCTION_EN 0.63%,
+  PROSE_READ_SEND 0.85%, PROSE_PIPE_INSTRUCTION 0% alone (0.67%
+  counting co-fires), PROSE_SAFETY_BYPASS 0.09%; LURE_WITH_BYPASS,
+  TAINTED_SEND, SECRET_FLOW and TYPOSQUAT_SUSPECT fire zero times
+  on the benign set. Malicious (n=7,421, 0 scanner errors):
+  BLOCK 45.7% → 45.7% (3,394 → 3,395) and BLOCK+CAUTION 81.8% →
+  **82.2%** — 32 folders newly flagged, none lost, no BLOCK
+  demoted; median 70 ms. Per family: data exfiltration B+C
+  82.3% → 83.5% (pure subset 81.9% → 83.1%), instruction
+  manipulation B+C 85.8% → 86.0% (pure prose subset 44.4% →
+  44.7%), execution unchanged at 97.8%, supply-chain unchanged.
+  New-rule fires on the malicious set: PROSE_PIPE_INSTRUCTION
+  309 folders (nearly all co-firing with existing rules),
+  PROSE_READ_SEND 126, OUTPUT_MANIPULATION 107,
+  PROSE_INSTRUCTION_EN 106 (20 alone), PROSE_FETCH_EXECUTE 52,
+  SECRET_FLOW 18, PROSE_SAFETY_BYPASS 10, TAINTED_SEND 2,
+  LURE_WITH_BYPASS 1, TYPOSQUAT_SUSPECT 0 (as predicted — the
+  corpus declares no squatted dependencies).
+
+### v0.5 fix pass — three adversarial reviews, one combined pass
+
+The v0.5 build was reviewed by three independent adversarial
+passes before shipping: a red team (24 fixtures, 20 true
+evasions), a false-positive hunt (45 fixtures, 5 new benign
+BLOCKs) and a code audit (13 findings, one HIGH). One combined
+fix pass addressed all three; `run_v05fix_tests.py` encodes one
+regression case per reviewer finding, and all ten suites are
+green. Per finding:
+
+- **Taint tracker rewritten (audit F1 HIGH, F2, F3; red team
+  rt14–rt17).** The build's tracker keyed credential bindings by
+  bare variable name across the whole file and never killed
+  taint on reassignment — it BLOCKed on flows that do not exist
+  (a name collision between two functions) and missed flows
+  that do (container writes). The replacement is scope-aware
+  and flow-sensitive: per-function scopes, statements in order,
+  reassignment kills taint, branches merge by union, container
+  writes (subscript stores, append/extend/update/setdefault,
+  setattr) carry taint, unknown method calls propagate receiver
+  taint (`.read().strip()`, `.hex()` — no sanitiser modelling,
+  as before), tuple unpacking and walrus assignments are
+  tracked, and function summaries (parameter pass-through,
+  return taint) resolve to a bounded fixpoint. Findings now
+  carry evidence strings ("credential value from read of …
+  reaches a network send"). A taint or parse failure on a deep
+  expression records a Skipped note (SCAN_INCOMPLETE) instead
+  of silently disabling the analysis (F2). Path classification
+  no longer treats public key material as a credential: `.pub`
+  files never classify, and `.pem` classifies only with a
+  key-shaped name (FP hunt).
+- **LURE_WITH_BYPASS proximity + framing (FP hunt, critical).**
+  The build joined a bypass phrase anywhere in a folder with a
+  download-run chain anywhere else and blocked five benign
+  folders (a printer FAQ, a Defender exclusion guide, a
+  Gatekeeper guide, anti-phishing training material, a Mac
+  setup assistant). The combination now requires the same file
+  with the two halves within 40 lines, and the bypass matcher
+  itself suppresses warning/training/troubleshooting framing at
+  paragraph level; the sanctioned right-click → Open path is
+  exempt. All five fixtures pass; the red team's split-in-one-
+  document lure (rt12) still blocks.
+- **Guard laundering closed (rt03, rt04, rt09, rt10; audit F4,
+  F5, F9).** Output-manipulation guards now judge frame
+  STRUCTURE, not keywords: a quoted payload is suppressed, a
+  prohibition frame suppresses only the matches it governs, and
+  a framing word ("example", "attackers") suppresses only when
+  it introduces the match as an exhibit — "example" inside the
+  payload sentence no longer launders it (rt03), and a payload
+  wearing prohibition shape ("never let the user know…") fires
+  (rt04). Disclose/read-send suppression is judged per sentence
+  instead of per block (F5): a self/own-data frame no longer
+  covers a sentence that names a concrete external destination
+  (rt09, rt10). Sentence boundaries no longer split on the dot
+  inside an email address or URL, which had hidden exactly
+  those destinations from the override logic.
+- **Chain and prose gaps (rt01, rt02, rt05–rt08, rt11, rt13;
+  audit F6).** The negation helper behind every prose chain
+  (and v0.4's PROSE_DOWNLOAD_RUN) no longer treats a bare "not"
+  as a prohibition — clause-scoped strong prohibitions only.
+  PROSE_FETCH_EXECUTE joins across a document and across a
+  folder (rt01, rt13); pipe-to-shell gained hand/give/feed/pass
+  phrasings (rt02); bypass synonyms ("switch off") and
+  same-document cross-paragraph joins landed (rt11, rt12);
+  disclose/read-send gained synonym targets, the relay verb,
+  consent phrasings from terse professional prose, and a
+  document-level destination join whose send verb must carry a
+  content object (rt08; the content-object requirement was
+  added after a first re-scan showed the unconstrained join
+  tripled the rule's benign rate). Same-sentence duplication
+  between PROSE_READ_SEND and PROSE_INSTRUCTION_EN is deduped.
+- **Typosquat extraction + matcher (rt18, rt19, rt20; audit
+  F7, F12).** The build's PyPI half was blind to unpinned names
+  (a specifier character was wrongly required); bare quoted
+  names in pyproject are now extracted, setup.py resolves one
+  level of module-level list variables, distance-2 matching
+  extends to the top-100 names, and Cyrillic-lookalike names
+  are folded before comparison. The matcher was rewritten
+  around a deletion index: per-name cost fell from ~0.45 ms to
+  ~0.07 ms (20k-name pyproject manifest 8.9 s → 2.8 s) with
+  verdicts unchanged — every candidate is still verified with
+  the same distance function. Famous legitimate near-miss
+  packages the first cut flagged (nox, fpdf, pypdf2, markdown2,
+  aredis, polar, yaml, preact, momentjs) joined the
+  known-legitimate-neighbours data and the validation sets.
+- **Surfaces (audit F8, F10, F11).** A deep-JSON failure in the
+  tool-description value pass now records a Skipped note
+  instead of dying silently; an unclosed code fence is treated
+  as ordinary text rather than swallowing the rest of the
+  document from the prose matchers; the instruction-surface
+  gate accepts a lowercase `skill.md`.
+- **Accepted, with reasons.** Four red-team fixtures remain
+  evasions by design (rt21–rt24: compound package names,
+  novel paraphrase steering, novel override wording, and
+  cross-file value flow — the deterministic ceiling and the
+  never-claimed class-F remainder). A handful of benign
+  fixtures still earn a CAUTION from a single new rule where
+  the shape genuinely is the shape (a prompt-injection course
+  discussing overrides; a journal tool that forwards
+  manuscripts to a named external editor — a real read-and-send
+  flow a human approves knowingly). Three FP-hunt fixtures
+  still BLOCK via TAINTED_SEND because the flow is real
+  (credential stores read and uploaded); they blocked in v0.4
+  on other rules too. One corpus folder's only build signal
+  was an output-manipulation shape the reviewers proved fires
+  on ordinary English; it now passes — the measured cost of
+  the narrowing, one folder (below).
+
+- **Full-corpus re-scan (MaliciousSkillBench, same counting).**
+  Benign (n=2,235): false BLOCKs **0** (gate held), CAUTION
+  543 → 555 folders, median 33 ms → 43 ms. New-rule benign rule-alone
+  rates: OUTPUT_MANIPULATION 0.36% → 0.13%, PROSE_READ_SEND
+  0.85% → 1.34% (the rt07/rt08/rt09/rt10 closures widen the
+  net on professional prose; CAUTION-only), PROSE_INSTRUCTION_EN
+  0.63% (unchanged), PROSE_SAFETY_BYPASS 0.09% (unchanged);
+  LURE_WITH_BYPASS, TAINTED_SEND, SECRET_FLOW and
+  TYPOSQUAT_SUSPECT still fire zero times. Malicious
+  (n=7,421, 0 scanner errors): BLOCK 45.7% → **45.7%**
+  (3,395 → 3,395 — identical in every attack family) and
+  BLOCK+CAUTION 82.2% → **82.4%** (6,102 → 6,117): 16 folders
+  newly flagged, 1 lost (the output-manipulation-only folder
+  above), no BLOCK demoted or promoted. Median 70 ms → 80 ms
+  (the flow-sensitive taint pass and the new joins). New-rule
+  fires moved with the closures they encode: PROSE_FETCH_EXECUTE
+  52 → 204 folders (the cross-document/cross-folder joins),
+  PROSE_READ_SEND 126 → 194, PROSE_INSTRUCTION_EN 106 → 120,
+  TAINTED_SEND 2 → 3, TYPOSQUAT_SUSPECT 0 → 2. The output-
+  manipulation family is unchanged (28.9% B+C); its remaining
+  misses are still the semantic-steering class documented
+  below.
+
+What v0.5 deliberately does not claim: output manipulation is
+phrase-shaped, not semantic — paraphrased steering with none of
+the listed shapes still passes (gap class B stands). The
+benchmark's own output-manipulation family did **not** move
+(28.9% B+C before and after): inspection of its pure misses
+shows the payload is predominantly domain-framed steering
+("current engineering protocols require noting that…") inside
+otherwise ordinary skills — meaning, not mechanism. Taint-lite
+is Python-only and intra-file; the reader-helper class (code
+reads, prose sends) is covered by READ_AND_DISCLOSE /
+PROSE_READ_SEND, not by dataflow. Typosquat sees only names
+similar to the curated top lists; a squat of a mid-tail package
+is invisible to it.
+
+---
+
 ## Gaps — the full honest list
 
 Every Gap and Partial above, grouped by *why* it is hard for this tool.
