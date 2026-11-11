@@ -1,6 +1,6 @@
 # Audit coverage map
 
-How SkillScan v0.3's 41 deterministic rules line up against the techniques
+How SkillScan v0.4's 47 deterministic rules line up against the techniques
 documented in published audits of real malicious AI-agent skills and MCP
 servers.
 
@@ -11,7 +11,7 @@ servers.
   here.
 - "Evidence" means one thing only: an **existing** sample in `samples/` or
   `samples-mutations/`, or a fixture in `run_v02_tests.py` / `run_v03_tests.py`
-  (those suites build inert fixtures in a temp dir), that an existing test
+  / `run_v04_tests.py` (those suites build inert fixtures in a temp dir), that an existing test
   suite already scans, with the verdict that suite asserts. No new sample
   was created for this map beyond what those suites contain.
 - Where a rule plausibly addresses a technique but no existing sample
@@ -54,7 +54,7 @@ doing the work). That weakness is structural — see the Gaps section.
 |---|------------------------|----------|---------|-------------------------------|
 | S1 | Skill code reads credential stores (SSH keys, cloud credential files) and sends the contents to an outside server | **Covered** | SSH_CREDENTIAL_READ, CLOUD_CREDENTIAL_READ, NETWORK_SEND_DATA, EXFIL_COMBINATION | `samples/bad/ssh-stealer` — BLOCK, exit 2; `run_tests.py` asserts SSH_CREDENTIAL_READ and NETWORK_SEND_DATA fire (EXFIL_COMBINATION also fires). The same shape survives string-splitting, `chr()` codes, GET-parameter smuggling and UTF-16 encoding in `samples-mutations/01, 03, 11, 12, 14, 17` — all BLOCK in `run_mutation_tests.py` |
 | S2 | Encoded (e.g. base64) payload is decoded and then executed, often ending in a download piped straight into a shell | **Covered** | BASE64_OBFUSCATION, DECODE_AND_RUN, EVAL_EXEC, CURL_PIPE_BASH | `samples/bad/obfuscated-dropper` — BLOCK, exit 2; `run_tests.py` asserts EVAL_EXEC, DECODE_AND_RUN and CURL_PIPE_BASH fire. Chunked-base64 variant: `samples-mutations/10-b64-chunks-importlib` — BLOCK (DECODE_AND_RUN, DYNAMIC_IMPORT) |
-| S3 | The skill's *instructions* (SKILL.md prose) tell the agent/user to fetch and install untrusted software from an outside location, including archives a scanner cannot see inside | **Partial** | CURL_PIPE_BASH, RUNTIME_PACKAGE_INSTALL, NETWORK_ACCESS (all line rules also run over documentation) | Rule present, no dedicated sample yet. Documentation findings are deliberately capped at CAUTION and negated safety prose is skipped (scanner design), so a prose-only install instruction can never produce a BLOCK from SkillScan. No existing sample puts the download instruction in prose only |
+| S3 | The skill's *instructions* (SKILL.md prose) tell the agent/user to fetch and install untrusted software from an outside location, including archives a scanner cannot see inside | **Partial** | CURL_PIPE_BASH, INSTALL_FROM_URL, RUNTIME_PACKAGE_INSTALL, NETWORK_ACCESS (all line rules also run over documentation) | v0.4 gave this row its dedicated fixtures (`run_v04_tests.py`): an install instruction whose source is a URL, git source, archive file, or non-official index now fires the dedicated INSTALL_FROM_URL in prose — and, as the refinement's other side, prose that merely names a registry package no longer flags at all. Documentation findings are deliberately capped at CAUTION and negated safety prose is skipped (scanner design), so a prose-only install instruction can never produce a BLOCK from SkillScan. Still Partial for exactly that reason: the cap is a design stance, not a detection |
 | S4 | Obfuscated exfiltration commands are embedded in installation instructions rather than in code files | **Partial** | BASE64_OBFUSCATION, DECODE_AND_RUN, SSH_CREDENTIAL_READ, CLOUD_CREDENTIAL_READ (line rules run over `.md` too) | Rule present, no dedicated sample yet — the corpus's obfuscated samples keep the payload in code (`samples/bad/obfuscated-dropper`, mutation 10). In prose, DECODE_AND_RUN's block severity is capped to CAUTION like every documentation finding |
 | S5 | Instructions push the agent to weaken the machine: alter service/startup configuration so a backdoor persists, delete system files, loosen security settings | **Partial** | PERSISTENCE, RM_RF, FILE_DELETE, CHMOD_CHOWN | In *code* these fire at full severity — PERSISTENCE/RM_RF are exercised by the corpus's shell-shaped samples (e.g. `samples-mutations/06-shell-home-var`, BLOCK) and FILE_DELETE by `samples/caution/shell-automation` (CAUTION, asserted by `run_tests.py`). In *prose* the same words are capped at CAUTION; a dedicated persistence sample does not exist, so for PERSISTENCE specifically: rule present, no dedicated sample yet |
 | S6 | Prompt-injection wording in skill text: hidden or deceptive instructions outside the skill's stated purpose, "ignore previous instructions"-style overrides, fake system-message framing, Unicode/base64-smuggled instructions | **Partial** | BASE64_OBFUSCATION; v0.3: HIDDEN_TEXT, MARKDOWN_CONCEALMENT, NON_ENGLISH_INSTRUCTION | The *mechanics* half is now covered with fixtures: `run_v03_tests.py` proves Unicode Tags-block smuggling in a manifest description BLOCKs (and CAUTIONs without keywords), zero-width / BiDi / HTML-comment concealment CAUTIONs, Markdown hiding places (display:none, white-on-white, `<details>`) CAUTION, and instruction-attack phrases in 10 languages CAUTION — with benign multilingual controls (emoji ZWJ, Persian/Indic joiners, a Spanish cooking README) all PASS. The *meaning* half remains a Gap inside this Partial: no rule judges whether visible, plainly-worded prose is deceptive — that is a semantic judgement a deterministic rule set does not make |
@@ -306,6 +306,194 @@ is stated, not smoothed over:
 
 ---
 
+## v0.4 additions — the benchmark fix wave
+
+v0.4 came from measuring v0.2 against MaliciousSkillBench (9,740
+labelled skills; internal report in the project watch folder). Three
+targets, in the order the data ranked them:
+
+- **Dependency sources** (DEPENDENCY_SOURCE / DEPENDENCY_EXECUTION)
+  — the supply-chain family was the weakest measured family
+  (11.4% BLOCK in v0.2) and the one place a rival's lead was purely
+  structural. Dependency manifests (`package.json`, requirements
+  files, `pyproject.toml`, `setup.py`, `Pipfile` — plus template
+  manifests, `package.template.json` / `package.json.template`,
+  which are package.json files in waiting and get the same
+  install-script and dependency-source analysis) are now parsed for
+  WHERE each dependency comes from: a git URL, a direct http(s)
+  archive link, a local file path, or a non-official package index
+  is DEPENDENCY_SOURCE (CAUTION); the same package also running
+  code at install time — an npm lifecycle script, a behavioural
+  `setup.py`, a loader-injection install — or declaring an
+  unrestricted-exec MCP tool escalates it to DEPENDENCY_EXECUTION
+  (BLOCK). (Combination scoping narrowed to the same package
+  directory by the fix pass below: one package's lifecycle script
+  no longer escalates another package's source.) Registry-pinned manifests pass, fixture-proven in
+  `run_v04_tests.py`. Two honest limits: (1) the benchmark corpus
+  itself declares almost no off-registry dependencies (its
+  supply-chain labels ride on install *instructions*, covered by
+  INSTALL_FROM_URL below), so this family's measured gain on that
+  corpus is small — the rule exists because the shape is real in
+  the wild, not because the corpus rewards it; (2) typosquat /
+  name-similarity detection is deliberately NOT attempted — it
+  needs registry metadata (see gap class C, K6/K7) and a fixed
+  top-package list would false-positive against the long tail of
+  legitimate names.
+- **JS network + download-and-run** — the code-bearing miss census
+  found Node `http`/`https` module calls (`https.get(...)`,
+  `http.request(...)`) matched NO rule in v0.2/v0.3: NETWORK_ACCESS
+  now covers them, DYNAMIC_IMPORT covers a JS `require()` of a
+  computed (non-literal or string-concatenated) path, and the
+  combination — fetch + dynamic load in one file — is
+  DOWNLOAD_AND_RUN (BLOCK), the JS analogue of DECODE_AND_RUN.
+  Literal `require("name")` and fetch-only files stay at their
+  ordinary severities, fixture-proven both ways.
+- **Install-prose refinement** (INSTALL_FROM_URL; RUNTIME_PACKAGE_
+  INSTALL narrowed in documentation) — v0.2 put 17.7% of *benign*
+  skills into the CAUTION pile for one reason: their instructions
+  said "install <named package>". Documentation installs are now
+  classified by source: named registry packages, bare installs, and
+  declared-requirements installs no longer flag; a URL / git /
+  archive / local-path / custom-index source fires INSTALL_
+  FROM_URL (CAUTION) in prose and code alike. Code behaviour is
+  unchanged (a named install in a script still cautions as
+  RUNTIME_PACKAGE_INSTALL). Negated safety prose is still skipped
+  before classification. This narrows S3's noise without narrowing
+  its catch: the off-registry *source* is the lure shape.
+- **Adjacent fix the new fixtures exposed:** the `setup.py`
+  behaviour check matched module NAMES as bare words, so a
+  metadata-only `setup.py` declaring `requests` in
+  `install_requires` read as install-time network behaviour. The
+  check now requires usage form (import or call). Proven by the
+  v0.4 `setup.py` fixtures (plain metadata passes; dependency-link
+  sources still caution).
+- **SUBSTITUTION_EXEC documentation cap (precision fix, folded in
+  from the v0.3 re-run report):** v0.3 BLOCKed executing
+  substitutions inside documentation — code-fence examples in
+  prose — producing 15 false BLOCKs on the benchmark's benign set
+  and breaking the scanner's zero-false-BLOCK property. The
+  executing form in a documentation file is now capped at CAUTION,
+  like every other rule's documentation findings; the same shape
+  in a code file still BLOCKs. Measured on the full benign set:
+  false BLOCKs 15 → 0.
+- **Directive-comment recalibration (HIDDEN_TEXT):** the v0.3 fix
+  pass raised the HTML-comment bar to credential-grade keywords
+  only; the re-run showed the payload comments it lost are
+  DIRECTIVE-shaped — "[SYSTEM … DIRECTIVE] …", "OPERATIONAL
+  DIRECTIVE: you are configured as …" — agent-addressed orders in
+  framing vocabulary. A directive-shape tier now sits beside the
+  grade bar (bracketed meta-directive header; "directive" plus an
+  imperative; "execute the following"). Measured: 6 of the 20
+  HIDDEN_TEXT regression folders recovered (the other 14 carry
+  only a benchmark-harness "do not execute" label, present on the
+  benign side too and now explicitly banner-exempt), and the
+  shape matches 0 of 2,235 benign folders' comments.
+- **Prose chains and the agent-as-channel (PROSE_DOWNLOAD_RUN /
+  READ_AND_DISCLOSE):** two document/folder-level joins aimed at
+  the re-run's two big miss pools. PROSE_DOWNLOAD_RUN joins an
+  external archive/binary target + a download step + a run step
+  across one document — measured on the v0.3 prose-only miss pool
+  (984 folders): the rule fired in 146, and the pool's total
+  conversion was 193 (19.6%). READ_AND_DISCLOSE joins code that
+  reads local files with prose directing disclosure to an
+  external destination — measured conversion on the code-bearing
+  miss pool is small (3 folders): that pool's prose overwhelmingly
+  says "report to the user", which is the normal agent loop and
+  deliberately NOT flagged. The strict bar is the honest one; the
+  residual agent-as-channel class (reads parameterised files,
+  discloses in conversation) remains a documented gap (class F).
+
+### v0.4 fix pass — adversarial-review fixes (regression suite:
+`run_v04fix_tests.py`, 65 cases)
+
+Three independent reviews of the v0.4 build (red team 36 fixtures,
+false-positive hunter 51 fixtures, code auditor ~30 probes) found
+one critical defect class, a set of false BLOCKs, and a set of
+evasions. All are fixed in this pass; the version stays 0.4.0.
+
+- **Scanner DoS (auditor F1, critical).** Two v0.4 regexes were
+  quadratic — the PEP 508 direct-reference pattern and the prose
+  archive-target pattern; a 300 KB `setup.py` or a 1.9 MB
+  single-line `requirements.txt` hung the scanner for over a
+  minute. Both are rewritten as linear scans (bounded look-back
+  for direct references; extension-anchored search for archive
+  targets), and every other v0.4-new pattern was audited for the
+  same disease (the JS load-shape lookahead was also bounded).
+  Worst adversarial shape now scans in ~2 s; perf regression cases
+  are in the suite.
+- **Inert text is not behaviour (FP-1, FP-3, auditor F5/F6).**
+  Line rules and the dedicated matchers now distinguish comments
+  and string literals from live code in Python, shell, and JS/TS
+  files: a substitution quoted in a comment is dropped (not merely
+  capped), one inside a Python/JS string caps at CAUTION, and one
+  in live code still BLOCKs — per site, so a file that both quotes
+  the pattern and executes it still BLOCKs. `setup.py` behaviour
+  analysis runs on string-stripped code, `urllib.parse` is no
+  longer classified as network access anywhere (it manipulates URL
+  strings; `urllib.request` still counts), and a fetch *word* in a
+  JS comment is no longer fetch evidence for DOWNLOAD_AND_RUN.
+- **Routine install hooks (FP-2, auditor F2).** DEPENDENCY_
+  EXECUTION no longer escalates on routine lifecycle commands
+  (`tsc` builds, `patch-package`, `husky`, `node-gyp rebuild`,
+  git-describe version reads) and only combines within the same
+  package directory. The CAUTION findings themselves are
+  unchanged; download/execute-shaped hooks still escalate.
+- **Evasions closed.** Remote dynamic `import("https://…")` and
+  the fetch→write→literal-`require` two-stage dropper now BLOCK;
+  the banner exemption no longer swallows directive payloads, and
+  persona-override shapes joined the directive family (with
+  framework/legal directive documentation — Angular/Vue/CSS/EU —
+  recognised as documentation, not payloads); npm `overrides` /
+  yarn `resolutions`, requirements `-r` includes, folded strings
+  in `setup.py`, and single-quoted Pipfile sources are read;
+  malformed `package.json` still gets raw-text dependency and
+  script analysis; install classification covers `npm i`,
+  `pnpm add`, `bun add`, every command on a line, attached
+  `-i<url>` flags, userinfo in index URLs, and trailing comments;
+  READ_AND_DISCLOSE joins across a paragraph block, stems its
+  verbs (uploading, delivering), accepts named-platform
+  destinations and `cat`/`read_csv` readers — while honouring
+  explicit negations, consent gates, self-recipients, and local
+  destinations; PROSE_DOWNLOAD_RUN joins across a folder's
+  documents and accepts `.sh` targets and get/fetch/grab verbs,
+  with bare-URL targets requiring a staging step so "download the
+  app and run it" still passes; executing contexts for
+  substitutions include interpreter `-c`/`-e` and dot-source, and
+  the shell squeeze collapses backslash escapes (`c\url`).
+- **Acceptance results.** Red team: 36/36 fixtures at target
+  tiers (was 13 gaps). False-positive set: zero false BLOCKs
+  everywhere; the remaining CAUTIONs on that set are the by-design
+  ones (off-registry sources and direct-URL installs are CAUTION
+  findings on purpose, and two official-installer prose chains
+  stay CAUTION as accepted). Benign review folders and the benign
+  package corpus: 0 BLOCK, verdicts unchanged. All suites green,
+  including the 65 new fix-pass cases.
+- **Full-corpus re-scan (MaliciousSkillBench, same counting as
+  the v0.3 report).** Benign (n=2,235): false BLOCKs **15 → 0**
+  (the v0.3 regression is fully reversed), CAUTION 578 → 498
+  folders, median 32 ms. Malicious (n=7,421, 0 scanner errors):
+  BLOCK 45.9% → 45.7% and BLOCK+CAUTION 81.8% → 81.8% — detection
+  held flat by design (25 BLOCK→CAUTION demotions from the
+  inert-text caps, offset by new BLOCKs from the dropper and
+  combination fixes); misses 1,353 → 1,351. Per family:
+  execution/code-delivery BLOCK+CAUTION 95.6% → 97.8% (its misses
+  halved, 140 → 70); dependency/supply-chain BLOCK 12.0% → 13.2%
+  with BLOCK+CAUTION 88.6% → 87.4% (n=167, noise band);
+  instruction manipulation BLOCK+CAUTION 87.8% → 85.8% and the
+  pure prose-only subset 51.8% → 44.4% — the honest cost of the
+  directive-documentation narrowing above: recognisable framework
+  and legal documentation is no longer flagged, and some real
+  manipulation prose is shaped like it. Median malicious scan
+  89 ms (v0.3: 90 ms).
+
+What v0.4 deliberately does not claim: the largest miss class —
+prose-only skills whose payload is pure instruction manipulation —
+is unchanged (gap class B stands; it is semantic). Cross-file
+value-level dataflow for the remaining code-bearing quiet skills is
+still not performed (gap class F stands).
+
+---
+
 ## Gaps — the full honest list
 
 Every Gap and Partial above, grouped by *why* it is hard for this tool.
@@ -373,11 +561,13 @@ PASS.
   (NETWORK_ACCESS) — chat clients and echo servers are benign socket
   code — and count toward combinations only when the receiver resolves
   to the socket module.
-- **S3, S4, S5, K5 (evidence gaps)** — rules exist and fire in code, but
-  the corpus has no dedicated sample for the prose form (S3, S4, S5) or
+- **S4, S5, K5 (evidence gaps)** — rules exist and fire in code, but
+  the corpus has no dedicated sample for the prose form (S4, S5) or
   the exact end-to-end shape (K5), so those mappings are asserted by rule
   inspection, not by a test. They are labelled that way in the tables
-  rather than upgraded to "Covered".
+  rather than upgraded to "Covered". (S3's prose form gained
+  dedicated fixtures in v0.4 — see the v0.4 section above; it stays
+  Partial only because prose findings cap at CAUTION by design.)
 
 ### F. Runtime behaviour (already stated in the README, repeated for completeness)
 - Behaviour decided by a server response, the date, or an encrypted config
@@ -390,6 +580,6 @@ PASS.
 
 *Map compiled from the four audits above and the scanner source
 (`skillscan/rules.py`, `skillscan/scanner.py`) and test suites as of
-v0.3.0. If a rule or a sample changes, this map must change with it — a
+v0.4.0. If a rule or a sample changes, this map must change with it — a
 coverage claim without a suite behind it is exactly the kind of thing
 this document exists to prevent.*

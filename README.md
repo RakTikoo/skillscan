@@ -128,7 +128,7 @@ See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the full guide:
 
 ## Rules
 
-41 deterministic rules. Any block-severity hit makes the verdict BLOCK;
+47 deterministic rules. Any block-severity hit makes the verdict BLOCK;
 otherwise any caution hit makes it CAUTION; otherwise PASS. Every rule
 also carries an OWASP mapping (LLM Top 10 / MCP Top 10 category codes),
 surfaced per finding in JSON output and in SARIF rule metadata — it is
@@ -140,7 +140,7 @@ triage metadata only and never affects the verdict.
 | CLOUD_CREDENTIAL_READ | block | Reads `~/.aws`, `~/.azure`, `~/.gcloud` credential material |
 | ENV_FILE_READ | block | Reads a `.env` file / loads dotenv (JS `process.env` is *not* this rule) |
 | ENVIRON_SECRET_ACCESS | caution | Accesses `os.environ` / `getenv(...)` / `process.env` |
-| NETWORK_ACCESS | caution | Makes network requests (`requests`, `urllib`, `httpx`, `fetch`, sockets) |
+| NETWORK_ACCESS | caution | Makes network requests (`requests`, `urllib`, `httpx`, `fetch`, sockets, Node `http`/`https` module calls) |
 | NETWORK_SEND_DATA | block | Sends data out (HTTP POST/PUT, GET with params/data, `curl -d`, `Request` with a body, socket send) |
 | EXFIL_COMBINATION | block | Skill reads credential material **and** has a network send channel |
 | SHELL_SUBPROCESS | caution | Runs programs via `subprocess` / `child_process` |
@@ -154,8 +154,9 @@ triage metadata only and never affects the verdict.
 | PERSISTENCE | block | Crontab, `.bashrc`, LaunchAgents, systemd, autostart entries (in code; in docs it is a caution) |
 | HOME_OR_SYSTEM_WRITE | caution | Resolves/touches home or system paths (`Path.home()`, `expanduser`, `$HOME`, `/etc/`, `getpwuid`, `os.homedir()`) |
 | CHMOD_CHOWN | caution | Changes permissions/ownership (`chmod`, `chown`, `os.chmod`) |
-| RUNTIME_PACKAGE_INSTALL | caution | Installs packages at run time (`pip install`, `npm install`, `apt-get install`, …) |
-| DYNAMIC_IMPORT | caution | `importlib.import_module` that static review cannot resolve |
+| RUNTIME_PACKAGE_INSTALL | caution | Installs packages at run time (`pip install`, `npm install`, `apt-get install`, …). Documentation that merely tells the user to install a *named* package from the official registry (or the declared requirements file) is ordinary setup prose and is not flagged |
+| INSTALL_FROM_URL | caution | An install command takes its package from a URL, git source, archive file, local path, or non-official package index instead of the official registry |
+| DYNAMIC_IMPORT | caution | `importlib.import_module` that static review cannot resolve, or a JS `require()` of a computed, non-literal path |
 | CREDENTIAL_ENUMERATION | caution | Glob/walk patterns that look like credential discovery (`id_*`, `.ssh*`) |
 | MCP_UNRESTRICTED_EXEC | block | MCP manifest tool that runs arbitrary caller-supplied commands with no constraint |
 | MCP_UNRESTRICTED_READ | caution | MCP manifest tool that reads arbitrary files by unconstrained path |
@@ -169,11 +170,16 @@ triage metadata only and never affects the verdict.
 | ERROR_INFO_LEAK | caution | Returns raw exception text, a stack trace, or an environment dump as a tool result (logging the error and returning a plain message is not flagged) |
 | PACKAGE_INSTALL_SCRIPT | caution | Package runs code at install time: an npm lifecycle script (`preinstall`/`install`/`postinstall`/`prepare`) or a `setup.py` that reaches for subprocess/network/sockets |
 | PACKAGE_INSTALL_SCRIPT_EXEC | block | An install-time script downloads or executes outside code (curl/wget, pipe-to-shell, encoded payload, remote fetch) |
+| DEPENDENCY_SOURCE | caution | A dependency manifest (`package.json` — including `package.template.json` templates — requirements file, `pyproject.toml`, `setup.py`, `Pipfile`) sources a dependency from outside the official registry: a git URL, a direct archive link, a local file path, or a non-official index |
+| DEPENDENCY_EXECUTION | block | The skill both sources a dependency off-registry **and** runs code at install time (or declares an unrestricted-exec MCP tool) |
+| DOWNLOAD_AND_RUN | block | A JS/TS file both fetches remote content **and** dynamically loads code (`require()` of a computed path, or `eval`) — the JS download-and-run dropper shape |
+| PROSE_DOWNLOAD_RUN | caution | The instructions walk through a download-and-run chain by hand: fetch an archive or binary from an external source, then run/launch/install what arrived — the dropper pattern split across prose steps |
+| READ_AND_DISCLOSE | caution | The folder's code reads local files **and** its instructions direct sending/uploading content to an external destination (URL, email, server, webhook) — the agent itself is the channel between the two halves |
 | HIDDEN_TEXT | block / caution | Concealed text: zero-width or bidirectional control characters, Unicode Tags-block payloads (BLOCK when the decoded payload contains instruction keywords), or HTML comments carrying instruction-like content. A single zero-width joiner in ordinary multilingual text does not fire |
 | NON_ENGLISH_INSTRUCTION | caution | Instruction-attack phrases in 14 other languages (override / send-the-credentials / keep-it-from-the-user shapes) — a phrase list, not language understanding. The lists are data files (`skillscan/phrases/<code>.json`): adding a language = adding one file |
 | ANY_LANGUAGE_STRUCTURE | caution | An instruction surface in ANY language pairs a private credential store (`~/.ssh`, `~/.aws`, a `.env` file, a browser credential store) with an outbound destination (URL, IP, email, curl/wget, webhook). Normal integration guides (your own token → the service's API URL) and safety warnings do not fire |
 | MARKDOWN_CONCEALMENT | caution | Content hidden from a rendered view (display:none, visibility:hidden, white-on-white, off-screen positioning, hidden attribute) that contains instruction-grade wording. A plain `<details>` disclosure block does not fire on its own |
-| SUBSTITUTION_EXEC | block / caution | Executes a download via shell substitution: `$(curl …)`, backtick curl/wget, `<(curl …)` (BLOCK). A substitution that only captures the download into a variable that is never executed — e.g. a Makefile `$(shell …)` assignment — is CAUTION |
+| SUBSTITUTION_EXEC | block / caution | Executes a download via shell substitution: `$(curl …)`, backtick curl/wget, `<(curl …)` (BLOCK in code files). A substitution that only captures the download into a variable that is never executed — e.g. a Makefile `$(shell …)` assignment — is CAUTION, and so is the executing form shown inside documentation, where it is a code-fence example rather than code that runs (v0.4 precision fix) |
 | ENV_INJECTION | caution | Touches `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` / `PYTHONSTARTUP`, or writes a fixed-name file under `/tmp` and makes it executable or runs it |
 | ENV_INJECTION_INSTALL | block | An install-time or server-start context (npm lifecycle script, `setup.py`, MCP manifest env, a `.pth` startup file) sets `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` / `PYTHONSTARTUP` / (install contexts) `PYTHONPATH`, or a `.pth` file carries an `import` line |
 | SCAN_INCOMPLETE | caution | Some content could not be scanned, or nothing was scanned — the verdict is partial. Includes compiled code with no inspectable source: a `.pyc` with no matching `.py`, or a native binary in a folder with no source at all |
@@ -285,13 +291,15 @@ python3 run_edge_tests.py      # FIFO hang, oversize, empty, usage codes, UTF-16
 python3 run_security_tests.py  # hostile folders vs the scanner itself (see below)
 python3 run_v02_tests.py       # v0.2: secrets, metadata, browser stores, reverse shells, error leaks, npm/PyPI targets, Cursor rules, repo URLs, SARIF, Action + hook (fixtures are inert and built in a temp dir)
 python3 run_v03_tests.py       # v0.3: hidden text (zero-width/Tags/BiDi/comments), non-English instruction phrases, Markdown concealment, substitution exec, session sends, bytecode honesty, env injection, OWASP metadata (fixtures are inert and built in a temp dir)
+python3 run_v04_tests.py       # v0.4: dependency sources (off-registry manifests, install-execution combination), JS http/https + download-and-run, install-prose refinement (named-registry docs pass, URL installs flag), substitution documentation cap, directive-comment recalibration, prose download-run chain, read-and-disclose combination (fixtures are inert and built in a temp dir)
+python3 run_v04fix_tests.py    # v0.4 fix pass: scanner-DoS perf shapes, inert-text (comment/string) precision, routine-lifecycle + same-package combination scoping, urllib.parse classification, and one regression case per adversarial-review evasion (fixtures are inert and built in a temp dir)
 ```
 
 ## Coverage against published audits
 
 [`docs/AUDIT_COVERAGE.md`](docs/AUDIT_COVERAGE.md) maps 25 techniques
 from four published audits of real malicious skills / MCP servers
-against the 41 rules above. Summary (Covered / Partial / Gap per audit):
+against the 47 rules above. Summary (Covered / Partial / Gap per audit):
 
 | Audit | Covered | Partial | Gap |
 |-------|---------|---------|-----|
@@ -316,7 +324,7 @@ codes, and exits non-zero on any failure.
 
 SkillScan's own measured rates on a public labelled corpus —
 **MaliciousSkillBench** (9,740 labelled skills, pinned at commit
-`893afd6`), run 2026-11-10 with SkillScan **v0.3.0**. Malicious skills
+`893afd6`), run 2026-11-10 with SkillScan **v0.4.0**. Malicious skills
 were scanned as complete extracted folders; benign skills are shipped
 by the benchmark as frozen text, so each was scanned as a single
 `SKILL.md` folder. Nothing was executed — folders were read as text
@@ -325,43 +333,44 @@ only. Full methodology, counting rules and caveats:
 
 | Set | Skills | BLOCK | CAUTION | PASS |
 |-----|--------|-------|---------|------|
-| Malicious | 7,421 | **45.9%** (3,409) | 35.8% (2,659) | 18.2% (1,353) |
-| Benign | 2,235 | 0.67% false BLOCKs (15) | 25.9% (578) | 73.5% (1,642) |
+| Malicious | 7,421 | **45.7%** (3,394) | 36.1% (2,676) | 18.2% (1,351) |
+| Benign | 2,235 | 0% false BLOCKs (0) | 22.3% (498) | 77.7% (1,737) |
 
 Detection at BLOCK+CAUTION (flagged at any severity): **81.8%** of
-malicious skills; 26.5% of benign skills were flagged at any severity.
+malicious skills; 22.3% of benign skills were flagged at any severity.
 
 Detection by attack family (multi-label membership; BLOCK /
 BLOCK+CAUTION):
 
 | Family | Skills | BLOCK | BLOCK+CAUTION |
 |--------|--------|-------|---------------|
-| Privilege / tool-authority abuse | 1,004 | 74.6% | 99.1% |
-| Execution / code delivery | 3,205 | 74.2% | 95.6% |
-| Credential access | 197 | 55.8% | 94.9% |
-| Persistence / control | 249 | 55.4% | 90.0% |
-| Instruction / goal manipulation | 1,560 | 63.7% | 87.8% |
-| Data exfiltration / disclosure | 266 | 35.3% | 82.3% |
-| Resource / availability abuse | 330 | 22.7% | 91.2% |
-| Dependency / supply chain | 167 | 12.0% | 88.6% |
-| Integrity / output manipulation | 97 | 1.0% | 32.0% |
+| Privilege / tool-authority abuse | 1,004 | 74.4% | 99.3% |
+| Execution / code delivery | 3,205 | 74.1% | 97.8% |
+| Credential access | 197 | 55.3% | 95.4% |
+| Persistence / control | 249 | 55.0% | 89.6% |
+| Instruction / goal manipulation | 1,560 | 63.9% | 85.8% |
+| Data exfiltration / disclosure | 266 | 35.0% | 82.3% |
+| Resource / availability abuse | 330 | 22.7% | 90.0% |
+| Dependency / supply chain | 167 | 13.2% | 87.4% |
+| Integrity / output manipulation | 97 | 1.0% | 28.9% |
 
 Honest limits, stated plainly:
 
-- **Most misses are prose-only skills.** 984 of the 1,353 missed
+- **Most misses are prose-only skills.** 925 of the 1,351 missed
   malicious skills are a single `SKILL.md` with no code at all. Among
-  *pure* instruction-manipulation skills the BLOCK rate is 9.0%, and
+  *pure* instruction-manipulation skills the BLOCK rate is 8.8%, and
   pure output manipulation is ~1% — deterministic rules see behaviour
   shapes, not meaning.
 - **The benign side is prose-only** (see above), so the false-BLOCK
   figure measures prose-triggered false alarms, not code-triggered
   ones. That asymmetry is part of the corpus, and it is disclosed
   rather than smoothed over.
-- **v0.3 has a known false-positive regression:** all 15 benign false
-  BLOCKs (0.67%) come from one rule (`SUBSTITUTION_EXEC`) firing at
-  block severity on command-substitution examples inside benign
-  documentation. A fix is in progress; the number is published as
-  measured, not after the fix.
+- **v0.3's false-BLOCK regression is fixed.** v0.3 measured 15 benign
+  false BLOCKs (0.67%), all from one rule (`SUBSTITUTION_EXEC`)
+  firing at block severity on command-substitution examples inside
+  benign documentation. v0.4 measures **0** false BLOCKs on the same
+  benign set, and the benign flagged-at-any-severity rate fell from
+  26.5% to 22.3%.
 
 ## Licence
 
@@ -369,7 +378,7 @@ MIT — see [LICENSE](LICENSE). Copyright (c) 2026 RakTikoo.
 
 ## Status
 
-v0.3. v0.1 was a Week 1 spike hardened by adversarial review; v0.2 adds
+v0.4. v0.1 was a Week 1 spike hardened by adversarial review; v0.2 adds
 secret detection, cloud-metadata and browser-store rules, raw-socket
 reverse-shell detection, error-leak detection, npm/PyPI package
 targets, Cursor-rules handling, repo-URL scanning, SARIF output, and
@@ -381,7 +390,21 @@ execution, sends through session/client objects, compiled-code
 coverage honesty (bytecode or native binaries with no inspectable
 source can no longer read as clean), environment-injection shapes
 (LD_PRELOAD and friends, predictable temp files), and OWASP mapping
-metadata on every rule. Expect false
+metadata on every rule. v0.4 is the benchmark fix wave (measured
+against MaliciousSkillBench): dependency-source checks over package
+manifests (off-registry git/URL/path/index sources caution; the same
+paired with install-time execution blocks), Node http/https network
+coverage and a JS download-and-run rule, an install-prose
+refinement — documentation naming a registry package no longer
+cautions, while URL/archive/custom-index installs flag in prose and
+code alike — plus the v0.3 re-run's ranked fixes: executing
+substitutions inside documentation are capped at CAUTION (they are
+code-fence examples; the same shape in a script still blocks),
+directive-shaped HTML comments (agent-addressed orders in framing
+vocabulary) caution again, a prose download-and-run chain rule for
+download+execute instructions split across steps, and a
+read-and-disclose combination for skills whose code reads files
+while their prose sends the contents out. Expect false
 positives and false negatives; the rule set and corpus are the starting
 point, not the finished product. Issues and new evasion samples are
 welcome — a mutation that evades SkillScan is a valuable contribution.
