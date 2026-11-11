@@ -64,6 +64,12 @@ _OWASP_MAP: dict[str, str] = {
     "ERROR_INFO_LEAK": "LLM02, MCP10",
     "PACKAGE_INSTALL_SCRIPT": "LLM03, MCP04",
     "PACKAGE_INSTALL_SCRIPT_EXEC": "LLM03, MCP04, MCP05",
+    "DEPENDENCY_SOURCE": "LLM03, MCP04",
+    "DEPENDENCY_EXECUTION": "LLM03, MCP04, MCP05",
+    "INSTALL_FROM_URL": "LLM03, MCP04",
+    "DOWNLOAD_AND_RUN": "LLM03, MCP05",
+    "PROSE_DOWNLOAD_RUN": "LLM03, MCP04",
+    "READ_AND_DISCLOSE": "LLM02, MCP03",
     "SCAN_INCOMPLETE": "",
     "HIDDEN_TEXT": "LLM01, MCP03, MCP06",
     "NON_ENGLISH_INSTRUCTION": "LLM01, MCP06",
@@ -136,9 +142,10 @@ RULES: list[Rule] = [
         "NETWORK_ACCESS", "caution",
         "Makes network requests. Network access is common in honest skills, "
         "but it is also the channel used to send your data away — check where it talks to.",
-        r"((?<![\w.])(requests|urllib|httpx)\s*\.|(?<![\w.])http\.client\b|"
+        r"((?<![\w.])(requests|httpx)\s*\.|(?<![\w.])urllib\s*\.\s*(?:request|urlopen)\b|(?<![\w.])http\.client\b|"
         r"(?<![\w.])socket\s*\.\s*(socket|create_connection)\b|"
-        r"(?<![\w.])(fetch|axios|XMLHttpRequest)\s*\(|(?<![\w.])curl\s|(?<![\w.])wget\s)",
+        r"(?<![\w.])(fetch|axios|XMLHttpRequest)\s*\(|(?<![\w.])curl\s|(?<![\w.])wget\s|"
+        r"(?<![\w.])(?:node:)?https?\s*\.\s*(get|request)\s*\()",
     ),
     _rule(
         "NETWORK_SEND_DATA", "block",
@@ -223,15 +230,21 @@ RULES: list[Rule] = [
         "RUNTIME_PACKAGE_INSTALL", "caution",
         "Installs packages at run time (pip install / npm install / apt-get "
         "install) instead of declaring dependencies up front — the installed "
-        "code is unreviewed and unpinned.",
+        "code is unreviewed and unpinned. (Documentation that merely tells "
+        "the user to install a NAMED package from the official registry, or "
+        "to install the declared requirements file, is ordinary setup prose "
+        "and is not flagged; an install from a URL / archive / custom index "
+        "is flagged separately as INSTALL_FROM_URL.)",
         r"(pip3?\s+install|npm\s+install|yarn\s+add|apt(-get)?\s+install|brew\s+install|gem\s+install)",
     ),
     _rule(
         "DYNAMIC_IMPORT", "caution",
-        "Loads modules or functions dynamically (importlib / getattr) in a "
-        "way static review cannot fully resolve. Indirection like this is "
-        "how payloads hide from reviewers — read it by hand.",
-        r"(importlib\.import_module\s*\()",
+        "Loads modules or functions dynamically (importlib / getattr, or a "
+        "JS require() of a computed, non-literal path) in a way static "
+        "review cannot fully resolve. Indirection like this is how "
+        "payloads hide from reviewers — read it by hand.",
+        r"(importlib\.import_module\s*\(|"
+        r"(?<![\w.])require\s*\(\s*(?![\"'][^\"']*[\"']\s*[,)]))",
     ),
     _rule(
         "CREDENTIAL_ENUMERATION", "caution",
@@ -356,6 +369,74 @@ RULES: list[Rule] = [
         r"(?!)never-matches-line-level",  # manifest-level, scanner.py
     ),
     _rule(
+        "DEPENDENCY_SOURCE", "caution",
+        "A dependency manifest (package.json, requirements file, "
+        "pyproject.toml, setup.py, Pipfile) sources a dependency from "
+        "OUTSIDE the official package registry: a git URL, a direct "
+        "http(s) archive link, a local file path, or a non-official "
+        "package index. Registry artefacts are at least versioned and "
+        "independently scanned; off-registry code can change silently, "
+        "disappear, or never have been reviewed by anyone. On its own "
+        "this is a caution; combined with install-time code execution "
+        "it becomes DEPENDENCY_EXECUTION.",
+        r"(?!)never-matches-line-level",  # manifest-level, scanner.py
+    ),
+    _rule(
+        "DEPENDENCY_EXECUTION", "block",
+        "This skill both pulls a dependency from outside the official "
+        "registry (git URL / direct archive link / local path / custom "
+        "index) AND runs code at install time (an npm lifecycle script, "
+        "a setup.py with behaviour, a loader-injection install) or "
+        "declares an unrestricted-exec MCP tool. Unreviewed off-registry "
+        "code plus an automatic execution path is the malicious-package "
+        "shape: nothing a registry would have scanned ever gets a say.",
+        r"(?!)never-matches-line-level",  # scan-level combination, scanner.py
+    ),
+    _rule(
+        "INSTALL_FROM_URL", "caution",
+        "An install command (pip / npm / yarn / apt / brew / gem) takes "
+        "its package from a URL, a git source, an archive file, a local "
+        "path, or a non-official package index instead of the official "
+        "registry — the S3 install-lure shape. Whatever arrives from "
+        "there is unversioned and unreviewed. (Installing a NAMED "
+        "package from the official registry is ordinary and is not "
+        "flagged in documentation.)",
+        r"(?!)never-matches-line-level",  # classified per line, scanner.py
+    ),
+    _rule(
+        "DOWNLOAD_AND_RUN", "block",
+        "A JavaScript/TypeScript file both fetches remote content "
+        "(http/https module call, fetch, axios) AND dynamically loads "
+        "code (require() of a computed, non-literal path, or eval). "
+        "Fetching data is ordinary; fetching and then loading what "
+        "arrives — or a file it was written to — as code is the JS "
+        "download-and-run dropper shape: the executed code is whatever "
+        "the server sends at run time, never what was reviewed.",
+        r"(?!)never-matches-line-level",  # file-level check in scanner.py
+    ),
+    _rule(
+        "PROSE_DOWNLOAD_RUN", "caution",
+        "The instructions walk through a download-and-run chain by "
+        "hand: fetch an archive or binary from an external source, "
+        "then run, launch or install what arrived. Split across "
+        "steps, no single line is a command — but the chain is the "
+        "S3 dropper pattern performed by the user or agent instead "
+        "of by a script. Only follow it when the source is one you "
+        "independently trust.",
+        r"(?!)never-matches-line-level",  # document-level, scanner.py
+    ),
+    _rule(
+        "READ_AND_DISCLOSE", "caution",
+        "The folder's code reads local files while its instructions "
+        "direct sending or uploading content to an external "
+        "destination (a URL, an email address, a server or webhook). "
+        "Nothing in the code connects the two — the agent itself is "
+        "the channel, carrying whatever the code read out of the "
+        "machine. Check exactly what is read and where it is sent "
+        "before using this skill.",
+        r"(?!)never-matches-line-level",  # scan-level combination, scanner.py
+    ),
+    _rule(
         "HIDDEN_TEXT", "block",
         "Text is concealed with invisible or deceptive characters: "
         "zero-width characters, Unicode Tags-block characters (which can "
@@ -464,5 +545,7 @@ FILE_LEVEL_RULE_IDS = {
     "HIDDEN_TEXT", "NON_ENGLISH_INSTRUCTION", "MARKDOWN_CONCEALMENT",
     "ENV_INJECTION_INSTALL", "SUBSTITUTION_EXEC",
     "ANY_LANGUAGE_STRUCTURE",
+    "DEPENDENCY_SOURCE", "DEPENDENCY_EXECUTION", "INSTALL_FROM_URL",
+    "DOWNLOAD_AND_RUN", "PROSE_DOWNLOAD_RUN", "READ_AND_DISCLOSE",
 }
 LINE_RULES = [r for r in RULES if r.id not in FILE_LEVEL_RULE_IDS]
