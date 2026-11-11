@@ -40,3 +40,9 @@ jobs:
         run: python3 run_v05_tests.py
       - name: v0.5 fix pass (taint scope/flow, lure proximity, guard laundering, typosquat extraction)
         run: python3 run_v05fix_tests.py
+      - name: v0.6 features (agent-config writes, agent credential reads)
+        run: python3 run_v06_tests.py
+      - name: v0.6 fix pass (mediation demotion, real-read discipline, red-team closures, timing)
+        run: python3 run_v06fix_tests.py
+      - name: v0.6 fix wave 2 (demotion hardening, folder mediation, resolver/verb gaps, audit-2 perf + stale-token)
+        run: python3 run_v06fix2_tests.py
