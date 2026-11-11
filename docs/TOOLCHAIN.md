@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: RakTikoo/skillscan@v0.2.0
+      - uses: RakTikoo/skillscan@main
         with:
           path: ./skills/my-skill        # folder to scan
           fail-on-block: "true"          # default: BLOCK fails the job

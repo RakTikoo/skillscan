@@ -1,6 +1,6 @@
 # Audit coverage map
 
-How SkillScan v0.4's 47 deterministic rules line up against the techniques
+How SkillScan v0.5's 57 deterministic rules line up against the techniques
 documented in published audits of real malicious AI-agent skills and MCP
 servers.
 
@@ -829,6 +829,6 @@ PASS.
 
 *Map compiled from the four audits above and the scanner source
 (`skillscan/rules.py`, `skillscan/scanner.py`) and test suites as of
-v0.4.0. If a rule or a sample changes, this map must change with it — a
+v0.5.0. If a rule or a sample changes, this map must change with it — a
 coverage claim without a suite behind it is exactly the kind of thing
 this document exists to prevent.*
