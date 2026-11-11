@@ -314,7 +314,7 @@ def main() -> int:
             check("sarif-structure",
                   sarif["version"] == "2.1.0"
                   and run["tool"]["driver"]["name"] == "SkillScan"
-                  and len(rule_ids) == 41  # 34 in v0.2; 40 in v0.3; 41 since the v0.3 fix pass (ANY_LANGUAGE_STRUCTURE)
+                  and len(rule_ids) == 47  # 34 in v0.2; 40 in v0.3; 41 since the v0.3 fix pass (ANY_LANGUAGE_STRUCTURE); 45 in v0.4 (+DEPENDENCY_SOURCE, DEPENDENCY_EXECUTION, INSTALL_FROM_URL, DOWNLOAD_AND_RUN); 47 with the V03-ranked additions (+PROSE_DOWNLOAD_RUN, READ_AND_DISCLOSE)
                   and len(run["results"]) >= 3
                   and all(res["ruleId"] in rule_ids for res in run["results"])
                   and levels_ok
