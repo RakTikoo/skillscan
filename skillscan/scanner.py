@@ -518,7 +518,687 @@ def _call_strings(node: ast.Call, sym: _Symbols) -> list[str]:
     return out
 
 
-def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> set[int]:
+# --- v0.5 taint-lite (design §2) -------------------------------------------
+# Minimal intra-file value-flow for Python: which *kinds* of source a
+# value came from, tracked through plain assignments, containers,
+# f-strings, transparent wrappers and file-local function returns.
+# Source kinds: "cred" (credential material — the only kind that can
+# BLOCK), "envsecret" (secret-named environment variable), "env",
+# "file", "input". There is deliberately NO sanitiser modelling:
+# base64-encoding a credential does not clean it.
+
+_CRED_FILENAME_TOKENS = {
+    "token", "credentials", "credential", "secret", "secrets",
+    "api_key", "apikey", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+}
+_SECRET_NAME_RE = re.compile(
+    r"(key|token|secret|password|passwd|credential|auth)", re.IGNORECASE)
+_TAINT_WRAPPERS = {
+    "str", "bytes", "json.dumps", "base64.b64encode",
+    "base64.b64decode", "binascii.hexlify", "binascii.unhexlify",
+}
+
+
+def _classify_path_value(value: str) -> str | None:
+    """'cred' when a path string names credential material, else None.
+    Same placeholder discipline as _check_credential_value: examples
+    and documentation placeholders never classify."""
+    if _PLACEHOLDER_ENV_RE.search(value):
+        return None
+    low = value.lower()
+    base = value.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    if base.endswith(".pub"):
+        # A public key is meant to be shared; it is not credential
+        # material even inside ~/.ssh (FP hunt: pubkey registrar).
+        return None
+    if ".ssh" in low or ".aws" in low or ".azure" in low \
+            or ".gcloud" in low:
+        return "cred"
+    if any(frag in value for frag in _BROWSER_STORE_FRAGMENTS):
+        return "cred"
+    if value == ".env" or value.endswith("/.env") or "/.env" in value:
+        return "cred"
+    if base in _CRED_FILENAME_TOKENS or base.endswith(".key"):
+        return "cred"
+    if base.endswith(".pem"):
+        # A .pem is as often a public CERTIFICATE as a private key;
+        # the extension alone does not classify it (FP hunt: cert
+        # uploader). A key-ish stem (client-key.pem, privkey.pem,
+        # api_token.pem) still does.
+        stem = base[:-4]
+        parts = set(re.split(r"[-_.]+", stem))
+        if stem in _CRED_FILENAME_TOKENS or parts & {
+                "key", "privkey", "private", "token", "secret",
+                "credentials", "credential"}:
+            return "cred"
+    return None
+
+
+def _path_candidates(node: ast.AST, sym: _Symbols) -> list[str]:
+    """String pieces an expression might denote: folded value, list
+    elements (index joins Path / parts[i] shapes included), plain
+    constants and environment strings."""
+    out: list[str] = []
+    folded = _fold_str(node, sym)
+    if folded:
+        out.append(folded)
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            out.append(sub.value)
+        elif isinstance(sub, ast.Name) and sub.id in sym.env_str:
+            out.append(sym.env_str[sub.id])
+        elif isinstance(sub, ast.Subscript) \
+                and isinstance(sub.value, ast.Name):
+            lst = sym.env_list.get(sub.value.id)
+            idx = sub.slice.value if isinstance(sub.slice, ast.Constant) \
+                else None
+            if lst and isinstance(idx, int) and 0 <= idx < len(lst):
+                out.append(str(lst[idx]))
+    return out
+
+
+def _classify_read_expr(node: ast.AST, sym: _Symbols) -> str:
+    for cand in _path_candidates(node, sym):
+        if _classify_path_value(cand) == "cred":
+            return "cred"
+        if cand.lower().strip("/. ") in _CRED_FILENAME_TOKENS:
+            return "cred"
+    return "file"
+
+
+def _func_returns(node: ast.FunctionDef) -> list[ast.expr]:
+    """Return expressions of one function, not descending into
+    nested function definitions."""
+    out: list[ast.expr] = []
+
+    def visit(stmt: ast.AST) -> None:
+        for child in ast.iter_child_nodes(stmt):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.Lambda)):
+                continue
+            if isinstance(child, ast.Return) and child.value is not None:
+                out.append(child.value)
+            visit(child)
+
+    for stmt in node.body:
+        if isinstance(stmt, ast.Return) and stmt.value is not None:
+            out.append(stmt.value)
+        visit(stmt)
+    return out
+
+
+def _taint_findings(tree: ast.AST, sym: _Symbols, rel: str, add,
+                    note=None) -> None:
+    """TAINTED_SEND (BLOCK) / SECRET_FLOW (CAUTION) for one file.
+    Best-effort and self-contained: any internal failure degrades to
+    no taint findings for the file (the line/AST rules still stand),
+    but the degradation is RECORDED via `note` — a silently disabled
+    taint layer would let one crafted deep expression hide a
+    textbook exfiltration (audit F2)."""
+    try:
+        _taint_findings_inner(tree, sym, rel, add)
+    except (RecursionError, MemoryError):
+        if note is not None:
+            note(Skipped(rel, "taint analysis skipped: expression "
+                              "nesting too deep", True))
+
+
+# Taint values are {kind: {origin, ...}} maps. Kinds: "cred",
+# "envsecret", "env", "file", "input"; origins are short human
+# descriptions ("read of ~/.ssh/id_rsa") carried into the finding's
+# evidence (audit F13). While a function body is analysed, its
+# parameters carry pseudo-kinds "param:<i>" so summaries can record
+# which parameters reach the return value.
+#
+# The tracker is SCOPE-AWARE and FLOW-SENSITIVE within a scope
+# (audit F1): bindings live per function (module scope separate),
+# statements are processed in order, and a plain reassignment KILLS
+# the previous taint of that name — `tok = read_token(); tok =
+# 'newsletter'; send(tok)` sends the literal, and a BLOCK verdict
+# must never rest on a bare-name collision between two functions.
+# Container WRITES are bindings too (red team rt14/rt15/rt16):
+# subscript stores, append/extend/update/setdefault/insert/add and
+# setattr all taint the container object. There is still NO
+# sanitiser modelling, and an unknown METHOD call propagates its
+# receiver's taint (rt17/F3): `.strip()`, `.hex()`, … do not clean
+# a credential.
+
+_TAINT_MUTATORS = {"append", "extend", "update", "setdefault",
+                   "insert", "add"}
+
+
+def _taint_merge(a: dict, b: dict) -> dict:
+    out = {k: set(v) for k, v in a.items()}
+    for k, v in b.items():
+        if k in out:
+            out[k].update(v)
+        else:
+            out[k] = set(v)
+    return out
+
+
+def _taint_findings_inner(tree: ast.AST, sym: _Symbols, rel: str,
+                          add) -> None:
+    func_nodes: list = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_nodes.append(node)
+
+    def locals_of(fn) -> set:
+        names = {a.arg for a in fn.args.args}
+        names |= {a.arg for a in fn.args.kwonlyargs}
+        if fn.args.vararg:
+            names.add(fn.args.vararg.arg)
+        if fn.args.kwarg:
+            names.add(fn.args.kwarg.arg)
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Name) \
+                    and isinstance(sub.ctx, ast.Store):
+                names.add(sub.id)
+        return names
+
+    def globals_of(fn) -> set:
+        out: set = set()
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Global):
+                out.update(sub.names)
+        return out
+
+    # summaries: name -> ({kind: origins} from the function's own
+    # sources, {param indices that reach the return value})
+    summaries: dict[str, tuple[dict, set]] = {}
+    module_env: dict[str, dict] = {}
+
+    def process_scope(body, fn, emit: bool):
+        """Process one scope's statements in order. Returns
+        (return_taint, env). With emit=True, sink findings are
+        added via `add`."""
+        is_module = fn is None
+        locals_set = set() if is_module else locals_of(fn)
+        globals_set = set() if is_module else globals_of(fn)
+        env: dict[str, dict] = {} if not is_module else module_env
+        if is_module:
+            env.clear()
+        params: list[str] = []
+        if fn is not None:
+            params = [a.arg for a in fn.args.args]
+            for i, p in enumerate(params):
+                env[p] = {f"param:{i}": {""}}
+            for a in fn.args.kwonlyargs:
+                env[a.arg] = {}
+        request_data: dict[str, dict] = {}
+        return_taint: dict = {}
+        # This scope's own folded string/list bindings, for path
+        # classification: the file-wide symbol table is flat, so a
+        # name reused in another function (a path-parts list here,
+        # an empty list there) clobbers it — the scope's own binding
+        # is the one a read in this scope actually sees (rt15).
+        scope_strs: dict[str, str] = {}
+        scope_lists: dict[str, list] = {}
+
+        def read_key(key: str) -> dict:
+            if key in env:
+                return {k: set(v) for k, v in env[key].items()}
+            if not is_module:
+                base = key.split(".", 1)[0]
+                if base not in locals_set or key in module_env:
+                    if key in module_env:
+                        return {k: set(v)
+                                for k, v in module_env[key].items()}
+            return {}
+
+        def write_key(key: str, value: dict, kill: bool) -> None:
+            base = key.split(".", 1)[0]
+            target = env
+            if not is_module and base in globals_set \
+                    and "." not in key:
+                target = module_env
+            if kill:
+                target[key] = {k: set(v) for k, v in value.items()}
+            else:
+                target[key] = _taint_merge(target.get(key, {}), value)
+
+        def expr_taint(node) -> dict:
+            if node is None:
+                return {}
+            if isinstance(node, ast.Name):
+                return read_key(node.id)
+            if isinstance(node, ast.Attribute):
+                dotted = _raw_dotted(node)
+                if dotted:
+                    t = read_key(dotted)
+                    if t:
+                        return t
+                return expr_taint(node.value)
+            if isinstance(node, ast.Constant):
+                return {}
+            if isinstance(node, ast.Subscript):
+                if _resolve(node.value, sym) == "os.environ":
+                    key = _fold_str(node.slice, sym)
+                    if key and _SECRET_NAME_RE.search(key):
+                        return {"envsecret":
+                                {f"environment variable {key}"}}
+                    return {"env": {"os.environ"}}
+                return expr_taint(node.value)
+            if isinstance(node, ast.Call):
+                return call_taint(node)
+            if isinstance(node, ast.BinOp):
+                return _taint_merge(expr_taint(node.left),
+                                    expr_taint(node.right))
+            if isinstance(node, ast.JoinedStr):
+                out: dict = {}
+                for v in node.values:
+                    if isinstance(v, ast.FormattedValue):
+                        out = _taint_merge(out, expr_taint(v.value))
+                return out
+            if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                out = {}
+                for elt in node.elts:
+                    out = _taint_merge(out, expr_taint(elt))
+                return out
+            if isinstance(node, ast.Dict):
+                out = {}
+                for part in list(node.keys) + list(node.values):
+                    out = _taint_merge(out, expr_taint(part))
+                return out
+            if isinstance(node, ast.IfExp):
+                return _taint_merge(expr_taint(node.body),
+                                    expr_taint(node.orelse))
+            if isinstance(node, ast.BoolOp):
+                out = {}
+                for v in node.values:
+                    out = _taint_merge(out, expr_taint(v))
+                return out
+            if isinstance(node, ast.UnaryOp):
+                return expr_taint(node.operand)
+            if isinstance(node, ast.Starred):
+                return expr_taint(node.value)
+            if isinstance(node, ast.Await):
+                return expr_taint(node.value)
+            if isinstance(node, ast.NamedExpr):
+                return expr_taint(node.value)
+            out = {}
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.expr):
+                    out = _taint_merge(out, expr_taint(child))
+            return out
+
+        def read_source_taint(path_node) -> dict:
+            cands = list(_path_candidates(path_node, sym))
+            for sub in ast.walk(path_node):
+                if isinstance(sub, ast.Subscript) \
+                        and isinstance(sub.value, ast.Name) \
+                        and isinstance(sub.slice, ast.Constant) \
+                        and isinstance(sub.slice.value, int):
+                    lst = scope_lists.get(sub.value.id)
+                    if lst and 0 <= sub.slice.value < len(lst):
+                        cands.append(str(lst[sub.slice.value]))
+                elif isinstance(sub, ast.Name) \
+                        and sub.id in scope_strs:
+                    cands.append(scope_strs[sub.id])
+            kind = "file"
+            origin = "file read"
+            for cand in cands:
+                if _classify_path_value(cand) == "cred" \
+                        or cand.lower().strip("/. ") \
+                        in _CRED_FILENAME_TOKENS:
+                    kind = "cred"
+                    origin = f"read of {cand}"
+                    break
+            return {kind: {origin}}
+
+        def call_taint(node: ast.Call) -> dict:
+            raw = _raw_dotted(node.func)
+            resolved = _resolve(node.func, sym)
+            if resolved in ("os.getenv", "os.environ.get") \
+                    or raw in ("getenv", "environ.get"):
+                key = _fold_str(node.args[0], sym) if node.args else None
+                if key and _SECRET_NAME_RE.search(key):
+                    return {"envsecret":
+                            {f"environment variable {key}"}}
+                return {"env": {"os.environ"}}
+            if raw == "input" or resolved == "input":
+                return {"input": {"user input"}}
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if attr in ("read_text", "read_bytes"):
+                    return read_source_taint(node.func.value)
+                if attr == "open":
+                    return read_source_taint(node.func.value)
+                if attr in ("read", "readline", "readlines",
+                            "encode", "decode"):
+                    return expr_taint(node.func.value)
+                if attr == "join":
+                    return expr_taint(node.args[0]) if node.args else {}
+                # Any other method call: the receiver's taint
+                # propagates (no sanitiser modelling), and so does
+                # an argument's — `sha256(tok).hexdigest()`,
+                # `tok.strip()`, `load_token().hex()` all keep the
+                # credential (rt17, audit F3).
+                out = expr_taint(node.func.value)
+                for arg in node.args:
+                    out = _taint_merge(out, expr_taint(arg))
+                for kw in node.keywords:
+                    out = _taint_merge(out, expr_taint(kw.value))
+                return out
+            if resolved in ("open", "io.open", "codecs.open") \
+                    or raw in ("open", "io.open", "codecs.open"):
+                if node.args:
+                    return read_source_taint(node.args[0])
+                return {"file": {"file read"}}
+            callee = resolved or raw
+            if callee in _TAINT_WRAPPERS:
+                out = {}
+                for arg in node.args:
+                    out = _taint_merge(out, expr_taint(arg))
+                for kw in node.keywords:
+                    out = _taint_merge(out, expr_taint(kw.value))
+                return out
+            fname = raw if raw and "." not in raw else None
+            if fname and fname in summaries:
+                kinds, param_map = summaries[fname]
+                out = {k: set(v) for k, v in kinds.items()}
+                for pos, arg in enumerate(node.args):
+                    if pos in param_map:
+                        out = _taint_merge(out, expr_taint(arg))
+                for kw in node.keywords:
+                    if kw.arg and kw.arg in params_of(fname) \
+                            and params_of(fname).index(kw.arg) \
+                            in param_map:
+                        out = _taint_merge(out, expr_taint(kw.value))
+                return out
+            return {}
+
+        def params_of(name: str) -> list:
+            for fnode in func_nodes:
+                if fnode.name == name:
+                    return [a.arg for a in fnode.args.args]
+            return []
+
+        def bind_target(target, value_taint: dict,
+                        value_node) -> None:
+            if isinstance(target, ast.Name):
+                write_key(target.id, value_taint, kill=True)
+                if value_node is not None:
+                    folded = _fold_str(value_node, sym)
+                    if folded is not None:
+                        scope_strs[target.id] = folded
+                    lst = _fold_list(value_node, sym)
+                    if lst is not None:
+                        scope_lists[target.id] = lst
+                if isinstance(value_node, ast.Call):
+                    resolved = _resolve(value_node.func, sym)
+                    raw = _raw_dotted(value_node.func)
+                    if resolved == "urllib.request.Request" \
+                            or raw == "Request":
+                        for kw in value_node.keywords:
+                            if kw.arg == "data":
+                                request_data[target.id] = \
+                                    expr_taint(kw.value)
+            elif isinstance(target, ast.Attribute):
+                dotted = _raw_dotted(target)
+                if dotted:
+                    write_key(dotted, value_taint, kill=True)
+            elif isinstance(target, ast.Subscript):
+                base = _raw_dotted(target.value)
+                if base:
+                    # A container write taints the container: the
+                    # value can be read back out of it (rt14).
+                    write_key(base, value_taint, kill=False)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                elts = target.elts
+                values = value_node.elts if isinstance(
+                    value_node, (ast.Tuple, ast.List)) \
+                    and len(value_node.elts) == len(elts) else None
+                for i, elt in enumerate(elts):
+                    bind_target(elt,
+                                expr_taint(values[i]) if values
+                                else value_taint,
+                                values[i] if values else value_node)
+            elif isinstance(target, ast.Starred):
+                bind_target(target.value, value_taint, value_node)
+
+        def apply_effects(stmt) -> None:
+            """Container mutations and walrus bindings anywhere in
+            one statement (rt14/rt15/rt16, audit F13)."""
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Call):
+                    f = sub.func
+                    if isinstance(f, ast.Attribute) \
+                            and f.attr in _TAINT_MUTATORS:
+                        base = _raw_dotted(f.value)
+                        if base:
+                            t: dict = {}
+                            for a in sub.args:
+                                t = _taint_merge(t, expr_taint(a))
+                            for kw in sub.keywords:
+                                t = _taint_merge(t,
+                                                 expr_taint(kw.value))
+                            write_key(base, t, kill=False)
+                    elif isinstance(f, ast.Name) and f.id == "setattr" \
+                            and len(sub.args) >= 3 \
+                            and isinstance(sub.args[1], ast.Constant) \
+                            and isinstance(sub.args[1].value, str):
+                        base = _raw_dotted(sub.args[0])
+                        if base:
+                            t = expr_taint(sub.args[2])
+                            write_key(f"{base}.{sub.args[1].value}",
+                                      t, kill=False)
+                            write_key(base, t, kill=False)
+                elif isinstance(sub, ast.NamedExpr) \
+                        and isinstance(sub.target, ast.Name):
+                    write_key(sub.target.id,
+                              expr_taint(sub.value), kill=True)
+
+        def check_sink(node: ast.Call) -> None:
+            dotted = _resolve(node.func, sym)
+            raw = _raw_dotted(node.func)
+            if not dotted and isinstance(node.func, ast.Attribute) \
+                    and isinstance(node.func.value, ast.Call):
+                ctor = _resolve(node.func.value.func, sym)
+                if ctor.endswith("Session"):
+                    dotted = ("requests." if ctor.startswith("requests")
+                              else "httpx.") + node.func.attr
+            module = dotted.split(".")[0] if dotted else ""
+            method = dotted.rsplit(".", 1)[-1] if dotted else ""
+            body: dict = {}
+            header: dict = {}
+            is_sink = False
+            if module in ("requests", "httpx", "aiohttp") \
+                    and (method in _SEND_METHODS or method == "request"):
+                is_sink = True
+                for arg in node.args[1:]:
+                    body = _taint_merge(body, expr_taint(arg))
+                for kw in node.keywords:
+                    if kw.arg in ("data", "json", "params", "files"):
+                        body = _taint_merge(body, expr_taint(kw.value))
+                    elif kw.arg in ("headers", "auth"):
+                        header = _taint_merge(header,
+                                              expr_taint(kw.value))
+            elif dotted.startswith("urllib.request") \
+                    and method == "urlopen":
+                if node.args:
+                    first = node.args[0]
+                    if isinstance(first, ast.Name) \
+                            and first.id in request_data:
+                        is_sink = True
+                        body = _taint_merge(body,
+                                            request_data[first.id])
+                    elif isinstance(first, ast.Call):
+                        for kw in first.keywords:
+                            if kw.arg == "data":
+                                is_sink = True
+                                body = _taint_merge(body,
+                                                    expr_taint(kw.value))
+            elif dotted.startswith("http.client") \
+                    and method in ("request", "putrequest",
+                                   "endheaders"):
+                is_sink = True
+                if len(node.args) >= 3:
+                    body = _taint_merge(body, expr_taint(node.args[2]))
+                for kw in node.keywords:
+                    if kw.arg == "body":
+                        body = _taint_merge(body, expr_taint(kw.value))
+                    elif kw.arg == "headers":
+                        header = _taint_merge(header,
+                                              expr_taint(kw.value))
+            elif isinstance(node.func, ast.Attribute) \
+                    and node.func.attr in ("send", "sendall", "sendto"):
+                is_sink = True
+                if node.args:
+                    body = _taint_merge(body, expr_taint(node.args[0]))
+            elif dotted.startswith("smtplib.") \
+                    and method in ("sendmail", "send_message"):
+                is_sink = True
+                for arg in node.args:
+                    body = _taint_merge(body, expr_taint(arg))
+                for kw in node.keywords:
+                    body = _taint_merge(body, expr_taint(kw.value))
+            if not is_sink:
+                return
+            cred_origins = sorted(
+                (body.get("cred") or set())
+                | (header.get("cred") or set()))
+            if cred_origins:
+                origin = cred_origins[0] if cred_origins[0] else \
+                    "a credential source"
+                add("TAINTED_SEND", rel, node.lineno,
+                    f"credential value from {origin} reaches a "
+                    f"network send")
+            elif "envsecret" in body:
+                origins = sorted(o for o in body["envsecret"] if o)
+                origin = origins[0] if origins else \
+                    "an environment variable"
+                add("SECRET_FLOW", rel, node.lineno,
+                    f"secret value from {origin} is sent in a "
+                    f"request body")
+
+        def visit_stmt(stmt) -> None:
+            nonlocal return_taint
+            if isinstance(stmt, (ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+                return  # separate scopes, processed on their own
+            if isinstance(stmt, ast.Return):
+                if stmt.value is not None:
+                    return_taint = _taint_merge(
+                        return_taint, expr_taint(stmt.value))
+                return
+            if isinstance(stmt, (ast.With, ast.AsyncWith)):
+                for item in stmt.items:
+                    apply_effects(item.context_expr)
+                    if isinstance(item.optional_vars, ast.Name):
+                        write_key(item.optional_vars.id,
+                                  expr_taint(item.context_expr),
+                                  kill=True)
+                for sub in stmt.body:
+                    visit_stmt(sub)
+                return
+            if isinstance(stmt, ast.If):
+                apply_effects(stmt.test)
+                saved = {k: {kk: set(vv) for kk, vv in v.items()}
+                         for k, v in env.items()}
+                for sub in stmt.body:
+                    visit_stmt(sub)
+                body_env = {k: {kk: set(vv) for kk, vv in v.items()}
+                            for k, v in env.items()}
+                env.clear()
+                env.update(saved)
+                for sub in stmt.orelse:
+                    visit_stmt(sub)
+                for key, val in body_env.items():
+                    env[key] = _taint_merge(env.get(key, {}), val)
+                return
+            if isinstance(stmt, (ast.For, ast.AsyncFor)):
+                apply_effects(stmt.iter)
+                bind_target(stmt.target, expr_taint(stmt.iter),
+                            stmt.iter)
+                saved = {k: {kk: set(vv) for kk, vv in v.items()}
+                         for k, v in env.items()}
+                for sub in stmt.body:
+                    visit_stmt(sub)
+                for key, val in list(env.items()):
+                    saved[key] = _taint_merge(saved.get(key, {}), val)
+                env.clear()
+                env.update(saved)
+                for sub in stmt.orelse:
+                    visit_stmt(sub)
+                return
+            if isinstance(stmt, ast.While):
+                apply_effects(stmt.test)
+                for sub in stmt.body:
+                    visit_stmt(sub)
+                for sub in stmt.orelse:
+                    visit_stmt(sub)
+                return
+            if isinstance(stmt, ast.Try) or type(stmt).__name__ == \
+                    "TryStar":
+                saved = {k: {kk: set(vv) for kk, vv in v.items()}
+                         for k, v in env.items()}
+                for sub in stmt.body:
+                    visit_stmt(sub)
+                body_env = {k: {kk: set(vv) for kk, vv in v.items()}
+                            for k, v in env.items()}
+                env.clear()
+                env.update(saved)
+                for handler in stmt.handlers:
+                    for sub in handler.body:
+                        visit_stmt(sub)
+                for key, val in body_env.items():
+                    env[key] = _taint_merge(env.get(key, {}), val)
+                for sub in stmt.orelse + stmt.finalbody:
+                    visit_stmt(sub)
+                return
+            # Simple statement: mutation effects first (they are
+            # additive), then sinks judge the statement's calls with
+            # bindings as they stand, then the statement's own
+            # bindings land (a reassignment kills prior taint).
+            apply_effects(stmt)
+            if emit:
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.Call):
+                        check_sink(sub)
+            if isinstance(stmt, ast.Assign):
+                value_taint = expr_taint(stmt.value)
+                for target in stmt.targets:
+                    bind_target(target, value_taint, stmt.value)
+            elif isinstance(stmt, ast.AnnAssign) \
+                    and stmt.value is not None:
+                bind_target(stmt.target, expr_taint(stmt.value),
+                            stmt.value)
+            elif isinstance(stmt, ast.AugAssign):
+                current = expr_taint(stmt.target)
+                merged = _taint_merge(current,
+                                      expr_taint(stmt.value))
+                bind_target(stmt.target, merged, stmt.value)
+
+        for stmt in body:
+            visit_stmt(stmt)
+        return return_taint, env
+
+    # Fixpoint over function summaries (bounded rounds), then one
+    # final pass with sink emission on the converged summaries.
+    for _round in range(5):
+        changed = False
+        process_scope(tree.body, None, emit=False)
+        for fnode in func_nodes:
+            ret, _env = process_scope(fnode.body, fnode, emit=False)
+            kinds = {k: v for k, v in ret.items()
+                     if not k.startswith("param:")}
+            param_map = {int(k.split(":", 1)[1]) for k in ret
+                         if k.startswith("param:")}
+            new_summary = (kinds, param_map)
+            if summaries.get(fnode.name) != new_summary:
+                summaries[fnode.name] = new_summary
+                changed = True
+        if not changed:
+            break
+    process_scope(tree.body, None, emit=True)
+    for fnode in func_nodes:
+        process_scope(fnode.body, fnode, emit=True)
+
+
+def _ast_findings(path: Path, rel: str, text: str, add, flags: dict,
+                  note=None) -> set[int]:
     """AST checks for one Python file. `flags` is the SCAN-scoped dict —
     only the "send" flag is allowed to merge outward into it (a send in
     any file is a send channel for the whole skill). decode / run_sink /
@@ -532,6 +1212,14 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> set[int]
     metadata_send_lines: set[int] = set()
     try:
         tree = ast.parse(text, filename=str(path))
+    except (RecursionError, MemoryError):
+        # A crafted deep expression defeats the parser itself; the
+        # AST layer (taint included) is off for this file and that
+        # must be RECORDED, not silent (audit F2).
+        if note is not None:
+            note(Skipped(rel, "python AST analysis skipped: "
+                              "nesting too deep", True))
+        return metadata_send_lines
     except Exception:
         return metadata_send_lines
     sym = _Symbols()
@@ -791,6 +1479,8 @@ def _ast_findings(path: Path, rel: str, text: str, add, flags: dict) -> set[int]
     if "decode" in local and "run_sink" in local:
         rel_d, line_d = local["decode"]
         add("DECODE_AND_RUN", rel_d, line_d)
+    # v0.5 taint-lite: credential/env-secret value flow to sends.
+    _taint_findings(tree, sym, rel, add, note=note)
     return metadata_send_lines
 
 
@@ -1762,6 +2452,322 @@ def _dependency_findings(rel: str, path: Path, text: str,
                 return
 
 
+# --- v0.5 offline typosquat check (design §4) ------------------------------
+# Declared dependency names vs a curated core list of top package
+# names per ecosystem, shipped as data files (skillscan/toplists/),
+# loaded exactly like phrases/. CAUTION only, never combined into
+# DEPENDENCY_EXECUTION. Distances use optimal-string-alignment
+# Damerau-Levenshtein (adjacent transposition costs 1).
+
+_TOPLIST_CACHE: dict[str, dict] = {}
+
+
+def _load_toplist(ecosystem: str) -> dict:
+    if ecosystem not in _TOPLIST_CACHE:
+        data: dict = {"top_names": [], "known_legit_neighbours": []}
+        try:
+            raw = json.loads((Path(__file__).parent / "toplists"
+                              / f"{ecosystem}.json").read_text(
+                                  encoding="utf-8"))
+            if isinstance(raw, dict):
+                data = raw
+        except (OSError, ValueError):
+            pass
+        # Normalised forms are computed once, here — a manifest can
+        # declare thousands of names and must not re-normalise the
+        # whole list per name.
+        data["_tops_norm"] = [_normalize_dep_name(t, ecosystem)
+                              for t in data.get("top_names", [])]
+        data["_neighbours_norm"] = {
+            _normalize_dep_name(n, ecosystem)
+            for n in data.get("known_legit_neighbours", [])}
+        # (name, separator-stripped name, char counts) triples,
+        # precomputed: a manifest with thousands of deps must not
+        # re-derive these per declared name.
+        data["_tops_pairs"] = [
+            (t, re.sub(r"[-_.]", "", t), _char_counts(t), rank)
+            for rank, t in enumerate(data["_tops_norm"])]
+        _TOPLIST_CACHE[ecosystem] = data
+    return _TOPLIST_CACHE[ecosystem]
+
+
+def _char_counts(s: str) -> dict:
+    counts: dict[str, int] = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    return counts
+
+
+def _normalize_dep_name(name: str, ecosystem: str) -> str:
+    name = name.strip().strip("\"'").lower()
+    if ecosystem == "pypi":
+        return re.sub(r"[-_.]+", "-", name)
+    return name
+
+
+def _dl_distance(a: str, b: str, cap: int = 2) -> int:
+    """OSA Damerau-Levenshtein with an early-exit cap."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > cap:
+        return cap + 1
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev2: list[int] | None = None
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        best = cur[0]
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            value = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if (prev2 is not None and j > 1
+                    and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]):
+                value = min(value, prev2[j - 2] + 1)
+            cur[j] = value
+            best = min(best, value)
+        if best > cap:
+            return cap + 1
+        prev2, prev = prev, cur
+    return prev[lb]
+
+
+_CYRILLIC_FOLD = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p",
+    "с": "c", "х": "x", "у": "y", "і": "i",
+    "ѕ": "s", "ј": "j", "к": "k", "м": "m",
+    "н": "h", "т": "t", "в": "b", "ԁ": "d",
+})
+
+
+def _homoglyph_fold(name: str) -> str:
+    folded = name.translate(_CYRILLIC_FOLD)
+    return folded.replace("rn", "m").replace("0", "o") \
+        .replace("1", "l")
+
+
+def _deletes_upto2(s: str) -> set:
+    """All strings reachable from `s` by deleting one or two
+    characters (plus `s` itself). Two names within edit distance 2
+    always share such a string — the SymSpell observation — which
+    turns the per-name scan of every top name into dictionary
+    lookups (audit F7)."""
+    out = {s}
+    singles = set()
+    for i in range(len(s)):
+        singles.add(s[:i] + s[i + 1:])
+    out |= singles
+    for t in singles:
+        for i in range(len(t)):
+            out.add(t[:i] + t[i + 1:])
+    return out
+
+
+_MATCH_INDEX_CACHE: dict = {}
+
+
+def _match_index(tops: list) -> dict:
+    """Deletion index over the top names, built once per tops list
+    (keyed by identity, with a strong reference kept so the id
+    cannot be recycled)."""
+    key = id(tops)
+    cached = _MATCH_INDEX_CACHE.get(key)
+    if cached is not None and cached[0] is tops:
+        return cached[1]
+    pairs = []
+    for idx, t in enumerate(tops):
+        if isinstance(t, str):
+            pairs.append((t, re.sub(r"[-_.]", "", t), idx))
+        else:
+            pairs.append((t[0], t[1], idx))
+    exact = set()
+    by_squashed: dict[str, str] = {}
+    deletes: dict[str, set] = {}
+    rank: dict[str, int] = {}
+    for top, squashed, idx in pairs:
+        exact.add(top)
+        rank[top] = idx
+        by_squashed.setdefault(squashed, top)
+        if len(top) <= 40:
+            for variant in _deletes_upto2(top):
+                deletes.setdefault(variant, set()).add(top)
+    index = {"exact": exact, "by_squashed": by_squashed,
+             "deletes": deletes, "rank": rank}
+    _MATCH_INDEX_CACHE[key] = (tops, index)
+    return index
+
+
+def _typosquat_match(name: str, tops: list,
+                     neighbours: set[str]) -> tuple[str, int] | None:
+    """(top_name, distance) when `name` (already normalised) is a
+    near-miss of a top package, else None. Exact matches and known
+    legitimate neighbours never match. Candidate generation uses
+    the deletion index; every candidate is then verified with the
+    real distance function and the same prefix/rank rules as a
+    direct scan, so the index changes speed, never verdicts."""
+    if not name or name in neighbours:
+        return None
+    index = _match_index(tops)
+    if name in index["exact"]:
+        return None
+    squashed = re.sub(r"[-_.]", "", name)
+    if len(squashed) >= 4:
+        top = index["by_squashed"].get(squashed)
+        if top is not None and top != name:
+            return (top, 1)  # separator mutation
+    folded = _homoglyph_fold(name)
+    if folded != name and folded in index["exact"]:
+        return (folded, 1)  # homoglyph-lite
+    if len(name) > 42:
+        return None
+    candidates: set = set()
+    for variant in _deletes_upto2(name):
+        candidates |= index["deletes"].get(variant, set())
+    for top in sorted(candidates):
+        if abs(len(name) - len(top)) > 2:
+            continue
+        dist = _dl_distance(name, top)
+        if dist == 1:
+            return (top, 1)
+        if dist == 2 and name[0] == top[0]:
+            prefix = 0
+            for x, y in zip(name, top):
+                if x != y:
+                    break
+                prefix += 1
+            # Distance-2 needs a long shared prefix and either a
+            # reasonably long name, or one of the hundred most-
+            # impersonated packages: `requts` (6 chars, prefix 4)
+            # aimed at requests is the canonical squat shape, and
+            # the length floor alone let it through (rt20).
+            if prefix >= 4 and (len(name) >= 7
+                                or index["rank"].get(top, 10 ** 9)
+                                < 100):
+                return (top, 2)
+    return None
+
+
+def _typosquat_check_name(eco: str, raw_name: str, rel: str,
+                          lines: list[str], add) -> bool:
+    data = _load_toplist(eco)
+    tops = data["_tops_pairs"]
+    neighbours = data["_neighbours_norm"]
+    name = _normalize_dep_name(raw_name, eco)
+    hit = _typosquat_match(name, tops, neighbours)
+    if not hit:
+        return False
+    top, dist = hit
+    line_no = _find_line(lines, raw_name)
+    add("TYPOSQUAT_SUSPECT", rel, line_no,
+        f"{raw_name} (edit distance {dist} from '{top}')",
+        severity_cap="caution")
+    return True
+
+
+_NAME_TOKEN = r"[A-Za-z0-9\u00c0-\uffff][A-Za-z0-9._\u00c0-\uffff-]*"
+_REQ_NAME_RE = re.compile(r"^\s*(" + _NAME_TOKEN + r")")
+_EGG_RE = re.compile(r"[#&]egg=(" + _NAME_TOKEN + r")")
+# A quoted name followed by a specifier/extras character OR by its
+# closing quote: bare unpinned names ("reqeusts", one per line) are
+# a standard pyproject style, and requiring a specifier character
+# blinded the PyPI half of the check to them wholesale (rt19).
+_TOML_DEP_STR_RE = re.compile(
+    r"[\"']([A-Za-z0-9._\u00c0-\uffff-]+)\s*"
+    r"(?:[<>=!~^\[@;,]|[\"'])")
+_SETUP_REQ_RE = re.compile(r"install_requires\s*=\s*\[(.*?)\]",
+                           re.DOTALL)
+_SETUP_NAME_RE = re.compile(r"[\"']([A-Za-z0-9._\u00c0-\uffff-]+)")
+_SETUP_VAR_RE = re.compile(r"install_requires\s*=\s*([A-Za-z_][\w]*)")
+_PIPFILE_SECTION_RE = re.compile(r"^\s*\[(?:dev-)?packages\]\s*$")
+_PIPFILE_KEY_RE = re.compile(
+    r"^\s*\"?(" + _NAME_TOKEN + r")\"?\s*=")
+
+
+def _typosquat_findings(rel: str, path: Path, text: str,
+                        lines: list[str], add) -> None:
+    stem = path.name
+    suffix = path.suffix.lower()
+    if stem in _PACKAGE_JSON_NAMES:
+        try:
+            manifest = json.loads(text)
+        except ValueError:
+            return
+        if not isinstance(manifest, dict):
+            return
+        for section in ("dependencies", "devDependencies",
+                        "optionalDependencies", "peerDependencies",
+                        "bundledDependencies", "bundleDependencies",
+                        "overrides", "resolutions"):
+            deps = manifest.get(section)
+            if not isinstance(deps, dict):
+                continue
+            for dep_name, _spec in _iter_dep_specs(deps):
+                bare = dep_name.split(">")[-1]
+                targets = [bare]
+                if bare.startswith("@") and "/" in bare:
+                    targets.append(bare.split("/", 1)[1])
+                for target in targets:
+                    if _typosquat_check_name("npm", target, rel,
+                                             lines, add):
+                        return
+        return
+    if stem.startswith("requirements") and suffix == ".txt":
+        for line in lines:
+            clean = line.split("#", 1)[0].strip()
+            if not clean or clean.startswith("-"):
+                egg = _EGG_RE.search(line)
+                if egg and _typosquat_check_name(
+                        "pypi", egg.group(1), rel, lines, add):
+                    return
+                continue
+            m = _REQ_NAME_RE.match(clean)
+            if m and _typosquat_check_name(
+                    "pypi", m.group(1), rel, lines, add):
+                return
+        return
+    if stem == "pyproject.toml":
+        for line in lines:
+            for m in _TOML_DEP_STR_RE.finditer(line):
+                if _typosquat_check_name(
+                        "pypi", m.group(1), rel, lines, add):
+                    return
+        return
+    if stem == "setup.py":
+        m = _SETUP_REQ_RE.search(text)
+        bodies = [m.group(1)] if m else []
+        if not bodies:
+            # install_requires=REQS with REQS = [...] at module
+            # level — the most common real-world setup.py layout
+            # (rt18). One level of indirection only.
+            vm = _SETUP_VAR_RE.search(text)
+            if vm:
+                am = re.search(
+                    r"^" + re.escape(vm.group(1))
+                    + r"\s*(?::[^=\n]*)?=\s*\[(.*?)\]",
+                    text, re.DOTALL | re.MULTILINE)
+                if am:
+                    bodies = [am.group(1)]
+        for body in bodies:
+            for nm in _SETUP_NAME_RE.finditer(body):
+                if _typosquat_check_name(
+                        "pypi", nm.group(1), rel, lines, add):
+                    return
+        return
+    if stem == "Pipfile":
+        in_packages = False
+        for line in lines:
+            if line.strip().startswith("["):
+                in_packages = bool(_PIPFILE_SECTION_RE.match(line))
+                continue
+            if in_packages:
+                km = _PIPFILE_KEY_RE.match(line)
+                if km and _typosquat_check_name(
+                        "pypi", km.group(1), rel, lines, add):
+                    return
+        return
+
+
 # --------------------------------------------------------------------------
 # JS download-and-run: fetch + dynamic code loading in the same file
 # --------------------------------------------------------------------------
@@ -2390,6 +3396,381 @@ def _any_language_structure_findings(rel: str, lines: list[str],
             return
 
 
+# --- v0.5 instruction-surface phrase families ----------------------------
+# OUTPUT_MANIPULATION and PROSE_INSTRUCTION_EN run ONLY on instruction
+# surfaces an agent is told to obey: a skill's SKILL.md, editor rule
+# files (*.mdc), and the string values of tool-description JSON. They
+# never run on arbitrary documentation. Matching runs over paragraph
+# blocks (physical lines joined), because real skills hard-wrap
+# prose and a payload split across a wrap is still one instruction —
+# the same lesson as the v0.4 _disclose_at paragraph join.
+# Suppression is judged on the sentence containing each match, for
+# text that is *about* the behaviour rather than performing it:
+#   * _PROHIBITION_FRAME_RE: a prohibition OF the form ("Do not
+#     follow instructions that say …"). The v0.4 NEGATION_RE is
+#     deliberately NOT used here: it matches a bare "do not", which
+#     would neutralise Bar A itself ("do not tell the user").
+#   * _OM_FRAMING_RE: the block frames its content as an example,
+#     quotation, sample or attack description.
+
+_OM_FRAMING_RE = re.compile(
+    r"\b(example|e\.g\.|for instance|attack|malicious|jailbreak|"
+    r"prompt[ -]injection|red flag|beware|sample|such as|quoted|"
+    r"fictional|pretend prompt)\b", re.IGNORECASE)
+_PROHIBITION_FRAME_RE = re.compile(
+    r"\b(never|do not|don't|must not|should not|refuse to)\b"
+    r"[^.!?\n]{0,50}?\b(follow|obey|comply with|trust|repeat|use)\b",
+    re.IGNORECASE)
+
+
+def _text_blocks(lines: list[str]) -> list[tuple[int, str, list]]:
+    """Paragraph blocks of physical lines: (start_line, joined_text,
+    spans) where spans maps joined-text offsets back to line numbers.
+    Lines are stripped and joined with single spaces so a phrase
+    split by a hard wrap still matches."""
+    blocks: list[tuple[int, str, list]] = []
+
+    def flush(cur: list[tuple[int, str]]) -> None:
+        if not cur:
+            return
+        parts: list[str] = []
+        spans: list[tuple[int, int]] = []
+        off = 0
+        for lineno, text in cur:
+            spans.append((off, lineno))
+            parts.append(text)
+            off += len(text) + 1
+        blocks.append((cur[0][0], " ".join(parts), spans))
+
+    cur: list[tuple[int, str]] = []
+    for lineno, line in enumerate(lines, start=1):
+        if line.strip():
+            cur.append((lineno, line.strip()))
+        else:
+            flush(cur)
+            cur = []
+    flush(cur)
+    return blocks
+
+
+def _block_line(spans: list, offset: int) -> int:
+    line = spans[0][1]
+    for start, lineno in spans:
+        if start <= offset:
+            line = lineno
+        else:
+            break
+    return line
+
+
+def _surface_blocks(lines: list[str]) -> list:
+    """_text_blocks with fenced code regions removed: the phrase
+    families judge prose instructions, not command examples (a
+    fenced `curl -X POST` is API documentation; command shapes in
+    fences are the line rules' and chain rules' business)."""
+    fence_lines = [i for i, line in enumerate(lines)
+                   if line.lstrip().startswith("```")]
+    # An ODD number of fence lines means the last fence never
+    # closes; treating it as a fence would silently swallow the
+    # remainder of the file (audit F10) — treat the unpaired fence
+    # line as ordinary text instead.
+    unpaired = fence_lines[-1] if len(fence_lines) % 2 else -1
+    kept: list[str] = []
+    in_fence = False
+    for i, line in enumerate(lines):
+        if i != unpaired and line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            kept.append("")
+            continue
+        kept.append("" if in_fence else line)
+    return _text_blocks(kept)
+
+# Bar A — concealment from the user (design §3.3).
+_OM_A_RES = [
+    re.compile(r"(?:do not|don't|never)\s+(?:tell|inform|notify)\s+"
+               r"the\s+user\b", re.IGNORECASE),
+    re.compile(r"never\s+mention\b[^.!?\n]{0,60}?\bto\s+the\s+user\b",
+               re.IGNORECASE),
+    re.compile(r"never\s+mention\s+(?:this|that|it|the)\b",
+               re.IGNORECASE),
+    re.compile(r"\bhide\s+[^.!?\n]{0,30}?\bfrom\s+the\s+user\b",
+               re.IGNORECASE),
+    re.compile(r"\bkeep\s+(?:this|it|that)\s+(?:a\s+)?secret\s+"
+               r"from\s+the\s+user\b", re.IGNORECASE),
+    re.compile(r"(?:never|do not|don't)\s+let\s+the\s+user\s+know\b",
+               re.IGNORECASE),
+    re.compile(r"\bif\s+(?:the\s+user\s+)?asks?\b[^.!?\n]{0,50}?"
+               r"\b(?:credit|attribute)\b[^.!?\n]{0,30}?"
+               r"\b(?:your\s+own|yourself|own\s+analysis)\b",
+               re.IGNORECASE),
+    re.compile(r"\bwithout\s+(?:telling|informing|notifying)\s+"
+               r"the\s+user\b", re.IGNORECASE),
+    re.compile(r"\bconceal(?:s|ed|ing)?\b[^.!?\n]{0,40}?\bfrom\s+"
+               r"the\s+user\b", re.IGNORECASE),
+    re.compile(r"\bif\s+asked,?\s+(?:say|claim|deny|tell\s+them)\b",
+               re.IGNORECASE),
+    re.compile(r"\bpretend\s+(?:that\s+|you\s+)?[^.!?\n]{0,40}?"
+               r"\b(?:did\s+not|didn't|never\s+happened|never\s+ran)\b",
+               re.IGNORECASE),
+]
+# Bar A' — compliance steering (design §3.3).
+_OM_AP_RES = [
+    # "Never refuse" as compliance steering is the UNSCOPED shape —
+    # any request, a request from the user. A task-scoped "never
+    # refuse a request to rephrase a letter" is ordinary professional
+    # prose (FP hunt: HR letter assistant).
+    re.compile(r"\bnever\s+refuse\s+(?:any|all)\b", re.IGNORECASE),
+    re.compile(r"\bnever\s+refuse\b[^.!?\n]{0,60}?\brequests?\b"
+               r"[^.!?\n]{0,40}?\buser\b", re.IGNORECASE),
+    re.compile(r"\balways\s+comply\b(?![^.!?\n]{0,30}?"
+               r"user'?s\s+(?:requested|chosen|specified|preferred)"
+               r"\b)", re.IGNORECASE),
+    re.compile(r"\balways\s+agree\s+with\s+the\s+user\b", re.IGNORECASE),
+    re.compile(r"\bnever\s+warn\b", re.IGNORECASE),
+    re.compile(r"(?:do not|don't|never)\s+warn\s+the\s+user\b",
+               re.IGNORECASE),
+    re.compile(r"(?:do not|don't|never)\s+mention\b[^.!?\n]{0,40}?"
+               r"\b(?:risks?|warnings?|limitations?)\b", re.IGNORECASE),
+]
+# Bar B — recommendation bias (design §3.3): bias verb + quantifier on
+# one line, contrast mention somewhere in the same surface.
+_OM_VERB_RE = re.compile(
+    r"\b(recommend|suggest|promote|prefer|rank|present|favour|favor)\b",
+    re.IGNORECASE)
+_OM_QUANT_RE = re.compile(r"\b(always|only\s+ever|first)\b",
+                          re.IGNORECASE)
+_OM_GATE_RE = re.compile(
+    r"\bonly\s+(?:suggest|mention|show|name|if|when)\b|"
+    r"\bif\s+the\s+user\s+(?:asks|insists|requests)\b|"
+    r"\bnever\s+(?:mention|name|show|suggest)\b|"
+    r"\bdo\s+not\s+(?:mention|show|name|suggest)\b|"
+    r"\bunless\s+(?:asked|requested)\b", re.IGNORECASE)
+_OM_CONTRAST_RE = re.compile(
+    r"\b(alternatives?|competitors?|other\s+options|other\s+products|"
+    r"other\s+services|every\s+other\s+option)\b", re.IGNORECASE)
+
+
+def _om_suppressed(text: str) -> bool:
+    return bool(_PROHIBITION_FRAME_RE.search(text)
+                or _OM_FRAMING_RE.search(text))
+
+
+def _sentence_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Sentence boundaries around a span. A '.' only ends a
+    sentence when followed by whitespace or the end of the text —
+    the dots inside example.invalid, an email address or a
+    version number (2.31.0) must not truncate the sentence,
+    because suppression and destination logic judge whole
+    sentences (a truncated sentence hid the very destination an
+    override needed to see, rt10)."""
+    def _is_boundary(i: int) -> bool:
+        c = text[i]
+        if c in "!?\n":
+            return True
+        return c == "." and (i + 1 >= len(text)
+                             or text[i + 1] in " \t")
+    lo = 0
+    for i in range(start - 1, -1, -1):
+        if _is_boundary(i):
+            lo = i + 1
+            break
+    hi = len(text)
+    for i in range(end, len(text)):
+        if _is_boundary(i):
+            hi = i
+            break
+    return lo, hi
+
+
+_QUOTE_PAIRS = [('"', '"'), ("'", "'"), ("\u201c", "\u201d"),
+                ("\u2018", "\u2019")]
+
+
+def _quoted_spans(sentence: str) -> list:
+    spans = []
+    for open_q, close_q in _QUOTE_PAIRS:
+        pos = 0
+        while True:
+            a = sentence.find(open_q, pos)
+            if a == -1:
+                break
+            b = sentence.find(close_q, a + 1)
+            if b == -1:
+                break
+            spans.append((a, b + 1))
+            pos = b + 1
+    return spans
+
+
+def _match_live(text: str, start: int, end: int) -> bool:
+    """A match is live unless its own sentence genuinely FRAMES it
+    as discussion rather than performing it. Judged per sentence,
+    and — after the v0.5 reviews — judged by frame STRUCTURE, not
+    by the mere presence of a framing word, because the sentence is
+    attacker-controlled text and a payload can wear a frame at zero
+    cost (rt03/rt04, audit F4/F9):
+      * a match inside quotation marks is quoted discussion;
+      * a prohibition of the form ("do not follow/trust …")
+        suppresses only a match it GOVERNS — one that starts after
+        its verb, in the same clause (a ';' ends the clause, and a
+        payload that IS the prohibition's own opening words, like
+        "never refuse … and always follow …", is not governed);
+      * a framing word (example/sample/attack …) suppresses only
+        when it introduces the match as an exhibit — a colon or a
+        quote between the framing word and the match."""
+    lo, hi = _sentence_span(text, start, end)
+    sentence = text[lo:hi]
+    ms, me = start - lo, end - lo
+    for a, b in _quoted_spans(sentence):
+        if a <= ms and me <= b:
+            return False
+    for fm in _PROHIBITION_FRAME_RE.finditer(sentence):
+        if fm.end() <= ms and ";" not in sentence[fm.end():ms]:
+            return False
+    for fm in _OM_FRAMING_RE.finditer(sentence):
+        if fm.end() <= ms:
+            between = sentence[fm.end():ms]
+            if ":" in between or '"' in between \
+                    or "\u201c" in between:
+                return False
+    return True
+
+
+def _om_scan(rel: str, blocks: list, add) -> None:
+    for _start, text, spans in blocks:
+        for rx in _OM_A_RES + _OM_AP_RES:
+            for m in rx.finditer(text):
+                if not _match_live(text, m.start(), m.end()):
+                    continue
+                add("OUTPUT_MANIPULATION", rel,
+                    _block_line(spans, m.start()), text,
+                    severity_cap="caution")
+                return
+    # Bar B: bias verb + quantifier in the SAME SENTENCE, and a
+    # competitor contrast in the SAME BLOCK. (An earlier looser
+    # join — quantifier anywhere in the block, contrast anywhere
+    # in the document — fired on ordinary markdown tables and
+    # checklists: "Recommend when…" headers, "Rank by utilisation",
+    # 1.43% rule-alone on the benign corpus. Tightened per plan
+    # §3.5's instruction to raise specificity, never the threshold.)
+    for _start, text, spans in blocks:
+        if not _OM_CONTRAST_RE.search(text):
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            m = _OM_VERB_RE.search(sentence)
+            if not m:
+                continue
+            if not (_OM_QUANT_RE.search(sentence) or re.search(
+                    r"\bnever\b", sentence[: m.start()],
+                    re.IGNORECASE)):
+                continue
+            if not re.search(r"\b(always|only\s+ever)\b", sentence,
+                             re.IGNORECASE) \
+                    and not _OM_GATE_RE.search(text):
+                # "Rank X first, and present the alternatives
+                # openly below" is a presentation order, not bias:
+                # bare "first" counts only when the block also
+                # gates or suppresses the alternatives.
+                continue
+            off = text.find(sentence) + m.start()
+            if not _match_live(text, off, off + 1):
+                continue
+            add("OUTPUT_MANIPULATION", rel,
+                _block_line(spans, off), text,
+                severity_cap="caution")
+            return
+
+
+def _output_manipulation_findings(rel: str, lines: list[str],
+                                  add) -> None:
+    _om_scan(rel, _surface_blocks(lines), add)
+
+
+def _output_manipulation_values(rel: str, values: list[str],
+                                add) -> None:
+    _om_scan(rel, [(i + 1, v, [(0, i + 1)])
+                   for i, v in enumerate(values)], add)
+
+
+# PROSE_INSTRUCTION_EN (design §6, item d5): English system-prompt
+# manipulation shapes on the same instruction surfaces.
+_PIE_TARGET_WORD = r"(?:system\s+prompt|instructions|directions|guidance)"
+_PIE_RES = [
+    re.compile(r"\bignore\s+(?:all\s+|your\s+|the\s+)?"
+               r"(?:previous\s+|prior\s+|earlier\s+)?"
+               r"(?:instructions|directions)\b", re.IGNORECASE),
+    re.compile(r"\bignore\s+your\s+" + _PIE_TARGET_WORD + r"\b",
+               re.IGNORECASE),
+    re.compile(r"\bdisregard\s+(?:your\s+|the\s+|all\s+)?"
+               r"(?:(?:previous|prior|earlier)\s+)?"
+               + _PIE_TARGET_WORD + r"\b", re.IGNORECASE),
+    re.compile(r"\bforget\s+your\s+" + _PIE_TARGET_WORD + r"\b",
+               re.IGNORECASE),
+    re.compile(r"\breveal\s+your\s+system\s+prompt\b", re.IGNORECASE),
+    re.compile(r"\b(?:print|show|repeat|output|display)\s+"
+               r"(?:your\s+|the\s+)?system\s+prompt\b", re.IGNORECASE),
+    re.compile(r"\byou\s+are\s+now\s+in\s+developer\s+mode\b",
+               re.IGNORECASE),
+]
+_PIE_SEND_VERB_RE = re.compile(
+    r"\b(send|sends|sending|upload|uploads|uploading|mail|mails|"
+    r"forward|forwards|forwarding|deliver|delivers|post|posts|"
+    r"posting|relay|relays|relaying)\b", re.IGNORECASE)
+_PIE_TARGET_RE = re.compile(
+    r"\b(contents?|conversation|history|transcript|environment|"
+    r"credentials?|documents?|notes?)\b", re.IGNORECASE)
+_PIE_DEST_RE = re.compile(
+    r"https?://\S+|[\w.+-]+@[\w-]+\.[\w.]+|\bexternal\b",
+    re.IGNORECASE)
+
+
+def _pie_scan(rel: str, blocks: list, add,
+              claimed: frozenset = frozenset()) -> None:
+    for _start, text, spans in blocks:
+        for rx in _PIE_RES:
+            for m in rx.finditer(text):
+                if not _match_live(text, m.start(), m.end()):
+                    continue
+                add("PROSE_INSTRUCTION_EN", rel,
+                    _block_line(spans, m.start()), text,
+                    severity_cap="caution")
+                return
+        # Send shape: verb + target + external destination must
+        # share ONE sentence (a negated mention of "credentials"
+        # two sentences later is not a send instruction), and the
+        # consent / self / own / local suppressors are judged on
+        # THAT sentence — a frame in a neighbouring sentence must
+        # not launder this one (audit F5).
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            vm = _PIE_SEND_VERB_RE.search(sentence)
+            if (vm and _PIE_TARGET_RE.search(sentence)
+                    and _PIE_DEST_RE.search(sentence)
+                    and not _disclose_suppressed(sentence)):
+                line_no = _block_line(spans, text.find(sentence))
+                if line_no in claimed:
+                    # PROSE_READ_SEND already reported this exact
+                    # sentence; a second finding for the same words
+                    # is duplication, not coverage (FP hunt).
+                    return
+                add("PROSE_INSTRUCTION_EN", rel,
+                    line_no, text,
+                    severity_cap="caution")
+                return
+
+
+def _prose_instruction_en_findings(rel: str, lines: list[str],
+                                   add,
+                                   claimed: frozenset = frozenset()
+                                   ) -> None:
+    _pie_scan(rel, _surface_blocks(lines), add, claimed)
+
+
+def _prose_instruction_en_values(rel: str, values: list[str],
+                                 add) -> None:
+    _pie_scan(rel, [(i + 1, v, [(0, i + 1)])
+                    for i, v in enumerate(values)], add)
+
+
 # --- Markdown concealment ------------------------------------------------
 
 _STYLE_ATTR_RE = re.compile(r"style\s*=\s*[\"']([^\"']*)[\"']", re.IGNORECASE)
@@ -2788,7 +4169,8 @@ _CHAIN_EXECUTE_RE = re.compile(
 
 _CHAIN_STAGE_RE = re.compile(
     r"\b(?:extract|unzip|unpack|decompress)(?:s|ed|ing)?\b|"
-    r"\b(?:keep|save|store)\s+it\b|chmod\s+\+x",
+    r"\b(?:keep|save|store)\s+(?:it|the\s+(?:file|script|tool|"
+    r"download|archive)\b)|chmod\s+\+x",
     re.IGNORECASE)
 
 
@@ -2813,14 +4195,23 @@ def _prose_chain_parts(text: str):
             bool(_CHAIN_STAGE_RE.search(text)))
 
 
+_CHAIN_NEGATION_RE = re.compile(
+    r"\b(never|do not|don't|must not|should not|refuse[sd]?|"
+    r"avoid|forbidden|prohibited)\b", re.IGNORECASE)
+
+
 def _prose_chain_negated(text: str, pos: int) -> bool:
     """A warning that NAMES the chain to forbid it ("never download
     installer.zip from random sites and run it") is safety prose,
-    not a chain (audit F4): honour a negation on the target's line."""
-    line_start = text.rfind("\n", 0, pos) + 1
-    line_end = text.find("\n", pos)
-    line = text[line_start:len(text) if line_end == -1 else line_end]
-    return bool(NEGATION_RE.search(line))
+    not a chain (audit F4). The negation must GOVERN the chain:
+    a strong prohibition in the same clause, before the target.
+    A bare "not" elsewhere on the line ("This step is not
+    optional: download the tool … and run it") negates something
+    else and laundered live chains (audit F6)."""
+    lo, _hi = _sentence_span(text, pos, pos)
+    clause = max(text.rfind(":", lo, pos), text.rfind(";", lo, pos))
+    prefix = text[max(lo, clause + 1):pos]
+    return bool(_CHAIN_NEGATION_RE.search(prefix))
 
 
 def _prose_download_run_findings(rel: str, text: str, add) -> None:
@@ -2844,6 +4235,230 @@ def _prose_download_run_findings(rel: str, text: str, add) -> None:
         target.group(0)[:160], severity_cap="caution")
 
 
+# --- v0.5 prose chain extensions ------------------------------------------
+# Shared paragraph/step blocks: chains written as numbered steps or
+# bullet lists live in one blank-line-separated block.
+
+def _paragraph_blocks(text: str) -> list[tuple[int, int, str]]:
+    """(start_line, start_offset, block_text) per blank-line block."""
+    blocks: list[tuple[int, int, str]] = []
+    current: list[str] = []
+    start_line = 1
+    start_off = 0
+    off = 0
+    for idx, line in enumerate(text.split("\n"), start=1):
+        if line.strip():
+            if not current:
+                start_line, start_off = idx, off
+            current.append(line)
+        else:
+            if current:
+                blocks.append((start_line, start_off, "\n".join(current)))
+                current = []
+        off += len(line) + 1
+    if current:
+        blocks.append((start_line, start_off, "\n".join(current)))
+    return blocks
+
+
+# (d1) fetch-a-script-and-run-it, including anaphoric execute steps.
+_SCRIPT_URL_RE = re.compile(
+    r"https?://\S+?\.(?:sh|bash|py|ps1|rb|pl|bat|cmd)\b", re.IGNORECASE)
+_ANAPHOR_EXEC_RE = re.compile(
+    r"\brun\s+(?:it|that|the\s+(?:script|file|tool|program|installer|"
+    r"converter|helper))\b|\bexecute\s+(?:it|the\s+(?:script|file|"
+    r"tool|program))\b|\blaunch\s+(?:it|the\s+(?:script|file|tool|"
+    r"program))\b", re.IGNORECASE)
+
+
+def _prose_fetch_execute_findings(rel: str, text: str, add) -> None:
+    if not _CHAIN_DOWNLOAD_RE.search(text):
+        return
+    blocks = _paragraph_blocks(text)
+    for idx, (start_line, start_off, block) in enumerate(blocks):
+        m = _SCRIPT_URL_RE.search(block)
+        if m and (_CHAIN_EXECUTE_RE.search(block)
+                  or _ANAPHOR_EXEC_RE.search(block)):
+            if _prose_chain_negated(text, start_off + m.start()):
+                continue
+            line_no = start_line + block[: m.start()].count("\n")
+            add("PROSE_FETCH_EXECUTE", rel, line_no,
+                m.group(0)[:160], severity_cap="caution")
+            return
+        um = _URL_TARGET_RE.search(block)
+        if not (um and _CHAIN_DOWNLOAD_RE.search(block)):
+            continue
+        # Anaphoric execute in this block or the following one,
+        # WITH a staging step (save/store/keep it, extract, chmod):
+        # "download the app and run it" — no staging — is the
+        # ordinary app-install sentence and a v0.4 control case;
+        # fetch → stage to disk → run-the-staged-thing is the
+        # dropper shape this variant exists for.
+        following = blocks[idx + 1][2] if idx + 1 < len(blocks) else ""
+        staged = (_CHAIN_STAGE_RE.search(block)
+                  or _CHAIN_STAGE_RE.search(following)
+                  or "somewhere" in block.lower())
+        if staged and (_ANAPHOR_EXEC_RE.search(block)
+                       or _ANAPHOR_EXEC_RE.search(following)):
+            if _prose_chain_negated(text, start_off + um.start()):
+                continue
+            line_no = start_line + block[: um.start()].count("\n")
+            add("PROSE_FETCH_EXECUTE", rel, line_no,
+                um.group(0)[:160], severity_cap="caution")
+            return
+    # Document-level join (rt01): a script URL in one block, a
+    # filler paragraph, and "run the script" two blocks later is
+    # still one instruction — the block join alone let a single
+    # intervening paragraph defeat it.
+    m = _SCRIPT_URL_RE.search(text)
+    if m and (_CHAIN_EXECUTE_RE.search(text)
+              or _ANAPHOR_EXEC_RE.search(text)):
+        if _prose_chain_negated(text, m.start()):
+            return
+        line_no = text[: m.start()].count("\n") + 1
+        add("PROSE_FETCH_EXECUTE", rel, line_no,
+            m.group(0)[:160], severity_cap="caution")
+
+
+# (d2) pipe-a-download-into-a-shell instructions.
+_FETCH_TOKEN_RE = re.compile(
+    r"\b(?:curl|wget)\b|Invoke-WebRequest|\birm\b", re.IGNORECASE)
+_PIPE_SHELL_RE = re.compile(
+    r"\|\s*(?:sudo\s+)?(?:sh|bash|zsh)\b|\biex\b", re.IGNORECASE)
+_PIPE_PROSE_RE = re.compile(
+    r"\bpipes?\b[^.!?\n]{0,40}\b(?:sh|bash|shell|powershell)\b",
+    re.IGNORECASE)
+_PIPE_HAND_RE = re.compile(
+    r"\b(?:hand|give|feed|pass)\b[^.!?\n]{0,50}?\b(?:to|into)\s+"
+    r"(?:bash|sh|zsh|a\s+shell|the\s+shell)\b", re.IGNORECASE)
+
+
+def _prose_pipe_instruction_findings(rel: str, text: str, add) -> None:
+    lines = text.split("\n")
+    in_fence = False
+    fence: list[str] = []
+    fence_start = 0
+    for idx, line in enumerate(lines, start=1):
+        if line.lstrip().startswith("```"):
+            if in_fence:
+                block = "\n".join(fence)
+                if _FETCH_TOKEN_RE.search(block) and (
+                        _PIPE_SHELL_RE.search(block)
+                        or ("chmod" in block and "./" in block)):
+                    add("PROSE_PIPE_INSTRUCTION", rel, fence_start,
+                        fence[0][:160] if fence else "",
+                        severity_cap="caution")
+                    return
+                fence = []
+                in_fence = False
+            else:
+                in_fence = True
+                fence_start = idx
+                fence = []
+            continue
+        if in_fence:
+            fence.append(line)
+    for start_line, _off, block in _paragraph_blocks(text):
+        if _FETCH_TOKEN_RE.search(block) and (
+                _PIPE_PROSE_RE.search(block)
+                or _PIPE_HAND_RE.search(block)):
+            add("PROSE_PIPE_INSTRUCTION", rel, start_line,
+                block.split("\n")[0][:160], severity_cap="caution")
+            return
+
+
+# (d4) safety-bypass instructions. The LURE_WITH_BYPASS combination
+# (this + a download-and-run chain anywhere in the folder) is formed
+# in scan_folder.
+_BYPASS_RES = [
+    re.compile(r"\bdisable\b[^.!?\n]{0,40}?\b(?:antivirus|smart ?screen|"
+               r"gatekeeper|defender|firewall|virus\s+protection)\b",
+               re.IGNORECASE),
+    re.compile(r"\bturn\s+off\b[^.!?\n]{0,40}?\b(?:antivirus|"
+               r"smart ?screen|gatekeeper|defender|firewall|"
+               r"virus\s+protection)\b", re.IGNORECASE),
+    re.compile(r"\bswitch\s+off\b[^.!?\n]{0,40}?\b(?:antivirus|"
+               r"smart ?screen|gatekeeper|defender|firewall|"
+               r"virus\s+protection)\b", re.IGNORECASE),
+    re.compile(r"\bignore\s+(?:the\s+|any\s+)?(?:security|certificate|"
+               r"safety)\s+warnings?\b", re.IGNORECASE),
+    re.compile(r"\badd\s+(?:an?\s+)?(?:exception|exclusion)\b[^.!?\n]"
+               r"{0,40}?\b(?:antivirus|defender|firewall)\b",
+               re.IGNORECASE),
+    re.compile(r"\bbypass\s+(?:the\s+)?(?:security|antivirus|"
+               r"smart ?screen|gatekeeper)\b", re.IGNORECASE),
+]
+_RUN_ADMIN_RE = re.compile(
+    r"\brun\s+(?:it\s+|the\s+\w+\s+)?as\s+administrator\b|"
+    r"\brun\s+(?:it\s+)?with\s+sudo\b", re.IGNORECASE)
+_INSTALLISH_RE = re.compile(
+    r"\b(?:download|install|run|execute|launch|fetch)\b", re.IGNORECASE)
+
+
+# Paragraphs that DISCUSS protection-disabling rather than
+# instruct it: anti-phishing training ("Scammers may call … They
+# will tell you to disable your antivirus. Never do this"),
+# false-positive remedy docs, and temporary-with-restore
+# troubleshooting ("temporarily disable … turn it back on
+# afterwards"). Judged on the match's whole paragraph (FP hunt).
+_BYPASS_FRAME_RE = re.compile(
+    r"\b(?:scam|scammers|phishing|fraud|pretending\s+to\s+be|"
+    r"never\s+do\s+this|do\s+not\s+do\s+this|"
+    r"false\s+positives?|turn\s+it\s+back\s+on|"
+    r"re-?enable\b[^.!?\n]{0,40}?\bafter)\b", re.IGNORECASE)
+# Right-click → Open is Apple's own documented flow for opening an
+# unsigned app; "bypass the Gatekeeper warning, right-click the
+# app and choose Open" instructs that flow, not a disabling.
+_SANCTIONED_OPEN_RE = re.compile(
+    r"\bright[\s-]?click(?:ing|s|ed)?\b[^.!?\n]{0,60}?"
+    r"\bchoos(?:e|ing)\s+open\b|"
+    r"\bright[\s-]?click(?:ing|s|ed)?\b[^.!?\n]{0,40}?\bopen\b",
+    re.IGNORECASE)
+
+
+def _prose_safety_bypass_findings(rel: str, text: str, add) -> None:
+    has_context = bool(re.search(r"https?://", text)
+                       or _INSTALLISH_RE.search(text))
+    if not has_context:
+        return
+    # Paragraph blocks: a bypass instruction split by a hard wrap
+    # ("… — disable" / "SmartScreen and your antivirus …") is one
+    # instruction. Discussion-framed sentences are exempt.
+    singles = _text_blocks(text.split("\n"))
+    # A blank line between the verb and its target (rt12) defeats
+    # the per-block join; adjacent-block pairs are tried too.
+    pairs = []
+    for i in range(len(singles) - 1):
+        _s1, t1, sp1 = singles[i]
+        _s2, t2, sp2 = singles[i + 1]
+        off = len(t1) + 1
+        pairs.append((_s1, t1 + " " + t2,
+                      sp1 + [(off + o, ln) for o, ln in sp2]))
+    for _start, joined, spans in singles + pairs:
+        if _BYPASS_FRAME_RE.search(joined):
+            continue
+        for rx in _BYPASS_RES:
+            for m in rx.finditer(joined):
+                if not _match_live(joined, m.start(), m.end()):
+                    continue
+                sentence = _sentence_around(joined, m.start(),
+                                            m.end())
+                if _SANCTIONED_OPEN_RE.search(sentence):
+                    continue
+                add("PROSE_SAFETY_BYPASS", rel,
+                    _block_line(spans, m.start()), joined,
+                    severity_cap="caution")
+                return
+    for m in _RUN_ADMIN_RE.finditer(text):
+        window = text[max(0, m.start() - 200): m.start() + 200]
+        if _INSTALLISH_RE.search(window):
+            line_no = text[: m.start()].count("\n") + 1
+            add("PROSE_SAFETY_BYPASS", rel, line_no,
+                text.split("\n")[line_no - 1][:160],
+                severity_cap="caution")
+            return
+
+
 # The agent-as-channel shape: code that READS local files + prose
 # that directs DISCLOSURE to an external destination. Neither half
 # fires alone — a file reader is a utility, and send instructions
@@ -2855,7 +4470,7 @@ _CODE_READ_RE = re.compile(
     r"read_csv\s*\(|(?<![\w.])cat\s+[^\s|;&]+")
 _DISCLOSE_VERB_RE = re.compile(
     r"\b(?:send|upload|share|email|forward|transmit|post|deliver|"
-    r"publish)(?:ing|ed|es|s|d)?\b", re.IGNORECASE)
+    r"publish|relay)(?:ing|ed|es|s|d)?\b", re.IGNORECASE)
 _DISCLOSE_DEST_RE = re.compile(
     r"https?://\S+|[\w.+-]+@[\w-]+\.[\w.]+|\bserver\b|\bendpoint\b|"
     r"\bwebhook\b|\bexternal\b|"
@@ -2893,14 +4508,62 @@ _DISCLOSE_SUPPRESS_RES = [
         r"local\s+(?:server|host|machine|endpoint|network)\b|"
         r"localhost\b|127\.0\.0\.1|on\s+this\s+machine|"
         r"stays\s+on\s+this\s+machine", re.IGNORECASE),
+    re.compile(
+        r"\buser\s+(?:downloaded|provided|picked|selected|"
+        r"uploaded|shared|supplied|gave)\b|"
+        r"\bthe\s+user\s+picks\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:tell|inform|notify|show)\s+the\s+user\b"
+        r"[^.!?\n]{0,80}?\bbefore\s+(?:sending|send|uploading|"
+        r"posting)\b", re.IGNORECASE),
 ]
+
+_CONCRETE_DEST_RE = re.compile(
+    r"https?://\S+|[\w.+-]+@[\w-]+\.[\w.]+", re.IGNORECASE)
+_LOCAL_DEST_RE = re.compile(
+    r"localhost|127\.0\.0\.1|\[::1\]", re.IGNORECASE)
+
+
+def _disclose_suppressed(sentence: str, following: str = "") -> bool:
+    """Whether a consent / self / own / local frame genuinely covers
+    THIS sentence's send (rt09/rt10, audit F5). The frames assert
+    something about the destination — the user's own endpoint,
+    the user themself — so they hold only when the sentence names
+    no concrete destination they fail to describe: an author-
+    asserted "user's own endpoint" in front of a generic webhook
+    URL, or "email me" in front of a third-party address, covers
+    nothing. Consent-gate frames (the user clicks/approves/…)
+    describe the SEND, not the destination, and always cover.
+    Local frames cover local destinations."""
+    frames = [i for i, p in enumerate(_DISCLOSE_SUPPRESS_RES)
+              if p.search(sentence)]
+    if not frames and following:
+        # A tell-the-user-before-sending promise in the immediately
+        # following sentence is part of the same instruction
+        # ("… email the contents to support@vendor.example. Tell
+        # the user what was included before sending."). Only this
+        # frame extends past the sentence: it is a notification
+        # duty attached to the send, not a frame around it.
+        if _DISCLOSE_SUPPRESS_RES[5].search(following):
+            frames = [5]
+    if not frames:
+        return False
+    dests = _CONCRETE_DEST_RE.findall(sentence)
+    if not dests:
+        return True
+    if any(_LOCAL_DEST_RE.search(d) for d in dests):
+        return True
+    # Suppressor indices: 0 consent gates, 1 self-recipient,
+    # 2 configured/own, 3 local, 4 user-provided source,
+    # 5 tell-before-sending. Frames 1 and 2 assert something about
+    # the DESTINATION that a concrete external destination
+    # contradicts; 0, 4 and 5 describe the send or the data's
+    # provenance and still cover.
+    return any(i in (0, 4, 5) for i in frames)
 
 
 def _sentence_around(text: str, start: int, end: int) -> str:
-    lo = max(text.rfind(c, 0, start) for c in ".!?\n") + 1
-    stops = [p for p in (text.find(c, end) for c in ".!?\n")
-             if p != -1]
-    hi = min(stops) if stops else len(text)
+    lo, hi = _sentence_span(text, start, end)
     return text[lo:hi]
 
 
@@ -2938,13 +4601,126 @@ def _disclose_at(lines: list[str]) -> int | None:
                 # elsewhere must not neutralise a stealer line.
             if any(p.search(block)
                    for p in _DISCLOSE_SUPPRESS_RES):
-                continue  # the consent gate / self-recipient / own
-                # or local frame covers the WHOLE instruction block
-                # ("When the user clicks Share … send the bundle …
-                # Cancel sends nothing" — FP fixture 20), not just
-                # the verb's own sentence.
+                # The consent gate / self-recipient / own or local
+                # frame covers the WHOLE instruction block ("When
+                # the user clicks Share … send the bundle … Cancel
+                # sends nothing" — FP fixture 20), not just the
+                # verb's own sentence. BUT a self/own frame does
+                # not cover a concrete external destination the
+                # verb's own sentence names (rt09/rt10): "the
+                # user's own endpoint https://hooks…/collect" and
+                # "email me … send them to digest@external…" assert
+                # ownership the named destination contradicts.
+                dests = _CONCRETE_DEST_RE.findall(sentence)
+                if dests and not any(
+                        _LOCAL_DEST_RE.search(d) for d in dests):
+                    block_frames = {
+                        i for i, p in enumerate(_DISCLOSE_SUPPRESS_RES)
+                        if p.search(block)}
+                    if block_frames <= {1, 2}:
+                        pass  # frame overridden — fall through
+                    else:
+                        continue
+                else:
+                    continue
             return start + block[:m.start()].count("\n")
     return None
+
+
+# (d3) prose read-and-send: the read half in prose, the disclosure
+# half a send verb + STRICT destination (URL, email address, or an
+# "external" marker) in one sentence, with the shared consent /
+# self / own / local suppressors. No code read is required — the
+# agent is the channel for both halves. The destination test is
+# stricter than READ_AND_DISCLOSE's _disclose_at on purpose: with
+# no code-read pairing to constrain it, the bare word "server"
+# fired on ordinary API documentation (benign-corpus measurement),
+# and third-party subjects ("user sends photos…", "clients send
+# requests…") describe other people's traffic, not an instruction
+# to the agent.
+_PROSE_READ_RE = re.compile(
+    r"\b(?:read|open|collect|gather|load|index|scan)\b[^.!?\n]{0,80}?"
+    r"\b(?:files?|folder|directory|documents|contents|notes|records|"
+    r"text)\b", re.IGNORECASE)
+_THIRD_PARTY_SEND_RE = re.compile(
+    r"\b(?:user|users|client|clients|customer|customers|visitor|"
+    r"visitors|they|he|she)\s+(?:sends?|uploads?|forwards?|posts?|"
+    r"shares?|emails?)\b", re.IGNORECASE)
+
+
+def _prose_read_send_findings(rel: str, lines: list[str], add):
+    """Returns the physical lines this rule claimed (for the
+    same-sentence dedupe against PROSE_INSTRUCTION_EN's send
+    shape), or an empty list."""
+    text = "\n".join(lines)
+    if not _PROSE_READ_RE.search(text):
+        return []
+    blocks = _paragraph_blocks(text)
+    doc_has_dest = bool(_PIE_DEST_RE.search(text)
+                        or _DISCLOSE_CONTENT_RE.search(text))
+
+    def fire(joined: str, block_lines: list, start: int,
+             m) -> list:
+        acc = 0
+        line_no = start
+        for bl in block_lines:
+            if acc + len(bl) >= m.start():
+                break
+            acc += len(bl) + 1
+            line_no += 1
+        add("PROSE_READ_SEND", rel, line_no,
+            lines[line_no - 1] if 0 < line_no <= len(lines) else "",
+            severity_cap="caution")
+        return [line_no]
+
+    for start, _off, block in blocks:
+        block_lines = block.split("\n")
+        joined = " ".join(block_lines)
+        for m in _DISCLOSE_VERB_RE.finditer(joined):
+            window = joined[max(0, m.start() - 160): m.end() + 160]
+            if not (_PIE_DEST_RE.search(window)
+                    or _DISCLOSE_CONTENT_RE.search(window)):
+                continue
+            sentence = _sentence_around(joined, m.start(), m.end())
+            if NEGATION_RE.search(sentence):
+                continue
+            if _THIRD_PARTY_SEND_RE.search(sentence):
+                continue
+            _lo, _hi = _sentence_span(joined, m.start(), m.end())
+            if _disclose_suppressed(sentence, joined[_hi:_hi + 200]):
+                continue  # judged on the verb's own sentence: a
+                # consent/self/own frame in a neighbouring sentence
+                # must not launder this send (audit F5)
+            return fire(joined, block_lines, start, m)
+    if not doc_has_dest:
+        return []
+    # Document-level join (rt08): the destination may live in its
+    # own block — the natural "contact details at the end" layout —
+    # far beyond any per-block window. The read half is already
+    # established for the whole document; a live send verb anywhere
+    # in it completes the shape — but the verb's own sentence must
+    # carry a content object (contents / transcript / documents /
+    # …): with a document-wide destination, a bare send verb near
+    # nothing in a link-heavy document is documentation noise
+    # (fix-pass benign measurement: this join alone took the
+    # rule's benign rule-alone rate from 0.85% to 2.86% before
+    # the content-object requirement).
+    for start, _off, block in blocks:
+        block_lines = block.split("\n")
+        joined = " ".join(block_lines)
+        for m in _DISCLOSE_VERB_RE.finditer(joined):
+            sentence = _sentence_around(joined, m.start(), m.end())
+            if not _PIE_TARGET_RE.search(sentence):
+                continue
+            if NEGATION_RE.search(sentence):
+                continue
+            if _THIRD_PARTY_SEND_RE.search(sentence):
+                continue
+            _lo, _hi = _sentence_span(joined, m.start(), m.end())
+            if _disclose_suppressed(sentence, joined[_hi:_hi + 200]):
+                continue
+            return fire(joined, block_lines, start, m)
+    return []
 
 
 # --- .pth startup files -----------------------------------------------------
@@ -3023,6 +4799,12 @@ def scan_folder(root: Path) -> ScanResult:
     read_at: tuple[str, int] | None = None
     disclose_at: tuple[str, int] | None = None
     prose_docs: list[tuple[str, str]] = []
+    # v0.5 LURE_WITH_BYPASS combination inputs: first hit per
+    # (rule, file) — the combination now also judges PROXIMITY.
+    chain_pos: dict[str, int] = {}
+    bypass_pos: dict[str, int] = {}
+    # Lines PROSE_READ_SEND claimed, per file (PIE dedupe).
+    claimed_send: dict[str, set[int]] = {}
 
     def add(rule_id: str, rel: str, line: int, evidence: str = "", severity_cap: str | None = None) -> None:
         nonlocal send_at, cred_at, metadata_at
@@ -3050,6 +4832,10 @@ def scan_folder(root: Path) -> ScanResult:
             send_at = (rel, line)
         if rule_id == "CLOUD_METADATA_ACCESS" and metadata_at is None:
             metadata_at = (rel, line)
+        if rule_id in ("PROSE_DOWNLOAD_RUN", "PROSE_FETCH_EXECUTE"):
+            chain_pos.setdefault(rel, line)
+        if rule_id == "PROSE_SAFETY_BYPASS":
+            bypass_pos.setdefault(rel, line)
         scope = rel.rpartition("/")[0]
         if rule_id == "DEPENDENCY_SOURCE":
             dep_scopes.setdefault(scope, (rel, line))
@@ -3131,29 +4917,53 @@ def scan_folder(root: Path) -> ScanResult:
             # hidden-text, non-English and structure matchers over the
             # string VALUES themselves — an escaped payload is caught
             # after decoding. (Line numbers refer to the value list.)
+            parsed = None
+            parse_failed_deep = False
             try:
                 parsed = json.loads(text)
+            except (RecursionError, MemoryError):
+                parse_failed_deep = True
+            except ValueError:
+                parsed = None  # invalid JSON: raw-text rules stand;
+                # manifest analysis reports its own coverage.
+            if parse_failed_deep:
+                result.skipped.append(Skipped(
+                    rel, "JSON value analysis skipped: nesting too "
+                         "deep", True))
+            elif parsed is not None:
+                # Iterative value walk: a recursively-defined walk
+                # died silently at depth ~1000 and took the whole
+                # parsed-value pass (hidden text, OM, PIE) with it
+                # (audit F8).
+                def _string_values(root_node):
+                    stack = [root_node]
+                    while stack:
+                        node = stack.pop()
+                        if isinstance(node, str):
+                            yield node
+                        elif isinstance(node, dict):
+                            stack.extend(node.values())
+                        elif isinstance(node, list):
+                            stack.extend(node)
 
-                def _string_values(node):
-                    if isinstance(node, str):
-                        yield node
-                    elif isinstance(node, dict):
-                        for v in node.values():
-                            yield from _string_values(v)
-                    elif isinstance(node, list):
-                        for v in node:
-                            yield from _string_values(v)
-
-                value_lines = list(_string_values(parsed))
-                if value_lines:
-                    _hidden_text_findings(
-                        rel, "\n".join(value_lines), value_lines, True,
-                        add)
-                    _non_english_findings(rel, value_lines, add)
-                    _any_language_structure_findings(
-                        rel, value_lines, add)
-            except Exception:
-                pass
+                try:
+                    value_lines = list(_string_values(parsed))
+                    if value_lines:
+                        _hidden_text_findings(
+                            rel, "\n".join(value_lines), value_lines,
+                            True, add)
+                        _non_english_findings(rel, value_lines, add)
+                        _any_language_structure_findings(
+                            rel, value_lines, add)
+                        # v0.5: tool descriptions are instruction
+                        # surfaces.
+                        _output_manipulation_values(rel, value_lines,
+                                                    add)
+                        _prose_instruction_en_values(rel, value_lines,
+                                                     add)
+                except Exception:
+                    result.skipped.append(Skipped(
+                        rel, "JSON value analysis failed", True))
 
         # Python AST first: it identifies sends whose destination is a
         # cloud metadata endpoint itself, and the line pass below must
@@ -3161,7 +4971,9 @@ def scan_folder(root: Path) -> ScanResult:
         metadata_send_lines: set[int] = set()
         if suffix == ".py":
             try:
-                metadata_send_lines = _ast_findings(path, rel, text, add, flags)
+                metadata_send_lines = _ast_findings(
+                    path, rel, text, add, flags,
+                    note=result.skipped.append)
             except Exception:
                 # Deeply nested / pathological syntax trees can defeat the
                 # AST analyser (e.g. recursion limits). Line rules below
@@ -3290,6 +5102,7 @@ def scan_folder(root: Path) -> ScanResult:
             _package_findings(rel, path, text, lines, add, root,
                               note=result.skipped.append)
             _dependency_findings(rel, path, text, lines, add)
+            _typosquat_findings(rel, path, text, lines, add)
             if suffix in (".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx"):
                 # Comment-blanked text: a fetch word in a comment is
                 # not fetch evidence (audit F5).
@@ -3303,6 +5116,11 @@ def scan_folder(root: Path) -> ScanResult:
             if doc:
                 prose_docs.append((rel, text))
                 _prose_download_run_findings(rel, text, add)
+                _prose_fetch_execute_findings(rel, text, add)
+                _prose_pipe_instruction_findings(rel, text, add)
+                _prose_safety_bypass_findings(rel, text, add)
+                claimed_send[rel] = set(
+                    _prose_read_send_findings(rel, lines, add))
                 if disclose_at is None:
                     dl = _disclose_at(lines)
                     if dl is not None:
@@ -3319,6 +5137,12 @@ def scan_folder(root: Path) -> ScanResult:
             if doc:
                 _markdown_concealment_findings(rel, text, lines, add)
                 _any_language_structure_findings(rel, lines, add)
+                if path.name.lower() == "skill.md" or suffix == ".mdc":
+                    # v0.5 instruction-surface phrase families.
+                    _output_manipulation_findings(rel, lines, add)
+                    _prose_instruction_en_findings(
+                        rel, lines, add,
+                        frozenset(claimed_send.get(rel, ())))
             if doc or suffix == ".json":
                 _non_english_findings(rel, lines, add)
         except Exception:
@@ -3366,6 +5190,29 @@ def scan_folder(root: Path) -> ScanResult:
                 add("PROSE_DOWNLOAD_RUN", rel_doc, line_no,
                     t.group(0)[:160], severity_cap="caution")
 
+    # Folder-level fetch-execute join (rt13): the download in
+    # SKILL.md and the run step in docs/RUN.md is one chain split
+    # across files — the same join PROSE_DOWNLOAD_RUN already had.
+    if prose_docs and not any(k[0] == "PROSE_FETCH_EXECUTE"
+                              for k in index):
+        fetch_at = None
+        any_execute = False
+        for rel_doc, doc_text in prose_docs:
+            if _SCRIPT_URL_RE.search(doc_text) \
+                    and _CHAIN_DOWNLOAD_RE.search(doc_text):
+                if fetch_at is None:
+                    fetch_at = (rel_doc, doc_text)
+            if _CHAIN_EXECUTE_RE.search(doc_text) \
+                    or _ANAPHOR_EXEC_RE.search(doc_text):
+                any_execute = True
+        if fetch_at is not None and any_execute:
+            rel_doc, doc_text = fetch_at
+            m = _SCRIPT_URL_RE.search(doc_text)
+            if m and not _prose_chain_negated(doc_text, m.start()):
+                line_no = doc_text[: m.start()].count("\n") + 1
+                add("PROSE_FETCH_EXECUTE", rel_doc, line_no,
+                    m.group(0)[:160], severity_cap="caution")
+
     # Off-registry dependency sourcing is a caution alone, but paired
     # with an automatic execution path (install-time hook, loader
     # injection at install, an unrestricted-exec tool declaration) IN
@@ -3380,6 +5227,20 @@ def scan_folder(root: Path) -> ScanResult:
     # half fires alone; together the agent carries the data out.
     if read_at is not None and disclose_at is not None:
         add("READ_AND_DISCLOSE", disclose_at[0], disclose_at[1])
+
+    # v0.5 lure combination: a download-and-run chain + a safety-
+    # bypass instruction IN THE SAME FILE, NEAR EACH OTHER. The
+    # v0.5 build joined the two halves folder-wide, which BLOCKed
+    # ordinary vendor documentation — a printer FAQ in one file
+    # and an installer in another, a Defender-exclusion remedy in
+    # a troubleshooting doc (FP hunt: 5 benign BLOCKs, all from
+    # this join). A lure writes its disarm instruction next to its
+    # chain; proximity is part of the shape.
+    for rel_f, b_line in bypass_pos.items():
+        c_line = chain_pos.get(rel_f)
+        if c_line is not None and abs(c_line - b_line) <= 40:
+            add("LURE_WITH_BYPASS", rel_f, b_line)
+            break
 
     # Coverage honesty: suspicious skips (or scanning nothing at all) must
     # stop the folder from reading as a clean PASS.

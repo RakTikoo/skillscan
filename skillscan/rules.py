@@ -70,6 +70,16 @@ _OWASP_MAP: dict[str, str] = {
     "DOWNLOAD_AND_RUN": "LLM03, MCP05",
     "PROSE_DOWNLOAD_RUN": "LLM03, MCP04",
     "READ_AND_DISCLOSE": "LLM02, MCP03",
+    "OUTPUT_MANIPULATION": "LLM01, LLM08",
+    "PROSE_INSTRUCTION_EN": "LLM01, MCP06",
+    "PROSE_FETCH_EXECUTE": "LLM03, MCP04",
+    "PROSE_PIPE_INSTRUCTION": "LLM03, MCP04, MCP05",
+    "PROSE_READ_SEND": "LLM02, MCP03",
+    "PROSE_SAFETY_BYPASS": "LLM06, MCP05",
+    "LURE_WITH_BYPASS": "LLM03, MCP04, MCP05",
+    "TAINTED_SEND": "LLM02",
+    "SECRET_FLOW": "LLM02",
+    "TYPOSQUAT_SUSPECT": "LLM03, MCP04",
     "SCAN_INCOMPLETE": "",
     "HIDDEN_TEXT": "LLM01, MCP03, MCP06",
     "NON_ENGLISH_INSTRUCTION": "LLM01, MCP06",
@@ -437,6 +447,94 @@ RULES: list[Rule] = [
         r"(?!)never-matches-line-level",  # scan-level combination, scanner.py
     ),
     _rule(
+        "OUTPUT_MANIPULATION", "caution",
+        "The instructions steer what the agent's output should show or "
+        "hide: keeping information from the user, pretending, or always "
+        "pushing one option over alternatives. Output manipulation is "
+        "the agent lying or nudging on the skill's behalf — different "
+        "from a task description, and invisible unless you read the "
+        "instructions.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "PROSE_INSTRUCTION_EN", "caution",
+        "The instructions contain English system-prompt manipulation: "
+        "overriding or discarding earlier instructions, demanding the "
+        "system prompt, developer-mode phrasing, or an instruction to "
+        "send the user's data to an outside destination. Ordinary "
+        "skills describe a task; they do not reprogram the agent.",
+        r"(?!)never-matches-line-level",  # dedicated matcher in scanner.py
+    ),
+    _rule(
+        "PROSE_FETCH_EXECUTE", "caution",
+        "The instructions fetch a script or tool straight from a URL "
+        "and tell the agent to run it (sometimes only as 'run it'). "
+        "The executed code is whatever the server sends at run time — "
+        "the prose form of the download-and-run dropper pattern.",
+        r"(?!)never-matches-line-level",  # document-level, scanner.py
+    ),
+    _rule(
+        "PROSE_PIPE_INSTRUCTION", "caution",
+        "The instructions tell the agent (or you) to pipe a network "
+        "download straight into a shell — unverified remote code "
+        "executed sight-unseen, written as documentation instead of "
+        "as a command line.",
+        r"(?!)never-matches-line-level",  # document-level, scanner.py
+    ),
+    _rule(
+        "PROSE_READ_SEND", "caution",
+        "The instructions read local files or folders and direct "
+        "sending their contents to an outside destination (a URL, an "
+        "email address, a server or webhook) — data leaving the "
+        "machine by prose instruction, with the agent as the channel. "
+        "Check exactly what is read and where it goes.",
+        r"(?!)never-matches-line-level",  # document-level, scanner.py
+    ),
+    _rule(
+        "PROSE_SAFETY_BYPASS", "caution",
+        "The instructions ask for a safety control — antivirus, "
+        "SmartScreen, Gatekeeper, a certificate check — to be "
+        "disabled, turned off or ignored so something can run. "
+        "Legitimate tools do not need your protections switched off.",
+        r"(?!)never-matches-line-level",  # document-level, scanner.py
+    ),
+    _rule(
+        "LURE_WITH_BYPASS", "block",
+        "The skill both walks through fetching code to run AND asks "
+        "for a safety control to be disabled first — the classic "
+        "malware-install lure shape, split across the document so no "
+        "single line carries it.",
+        r"(?!)never-matches-line-level",  # scan-level combination, scanner.py
+    ),
+    _rule(
+        "TAINTED_SEND", "block",
+        "Values read from credential material — SSH keys, token or "
+        "credential files, cloud configuration, browser password "
+        "stores — flow into a network send in this code. The code may "
+        "never name a credential rule; the data flow itself is "
+        "credential exfiltration by construction.",
+        r"(?!)never-matches-line-level",  # AST taint check in scanner.py
+    ),
+    _rule(
+        "SECRET_FLOW", "caution",
+        "A secret-named environment variable's value flows into the "
+        "body of an outgoing request. Secrets belong in auth headers; "
+        "a secret in a payload body is logged, cached and forwarded "
+        "in places headers are not. (A service's own token in its own "
+        "Authorization header is ordinary and is not flagged.)",
+        r"(?!)never-matches-line-level",  # AST taint check in scanner.py
+    ),
+    _rule(
+        "TYPOSQUAT_SUSPECT", "caution",
+        "A declared dependency name is one small edit away from a "
+        "very popular package name — a transposed letter, a swapped "
+        "separator, a look-alike character. Typosquatting is how "
+        "malicious packages ride on a popular package's reputation; "
+        "verify the exact spelling against the project's official "
+        "documentation before installing.",
+        r"(?!)never-matches-line-level",  # manifest check in scanner.py
+    ),
+    _rule(
         "HIDDEN_TEXT", "block",
         "Text is concealed with invisible or deceptive characters: "
         "zero-width characters, Unicode Tags-block characters (which can "
@@ -547,5 +645,8 @@ FILE_LEVEL_RULE_IDS = {
     "ANY_LANGUAGE_STRUCTURE",
     "DEPENDENCY_SOURCE", "DEPENDENCY_EXECUTION", "INSTALL_FROM_URL",
     "DOWNLOAD_AND_RUN", "PROSE_DOWNLOAD_RUN", "READ_AND_DISCLOSE",
+    "OUTPUT_MANIPULATION", "PROSE_INSTRUCTION_EN", "PROSE_FETCH_EXECUTE",
+    "PROSE_PIPE_INSTRUCTION", "PROSE_READ_SEND", "PROSE_SAFETY_BYPASS",
+    "LURE_WITH_BYPASS", "TAINTED_SEND", "SECRET_FLOW", "TYPOSQUAT_SUSPECT",
 }
 LINE_RULES = [r for r in RULES if r.id not in FILE_LEVEL_RULE_IDS]
