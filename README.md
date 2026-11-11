@@ -186,7 +186,7 @@ triage metadata only and never affects the verdict.
 | SECRET_FLOW | caution | A secret-named environment variable's value flows into a request **body**. A service's own token in its own `Authorization` header is ordinary and does not fire |
 | TYPOSQUAT_SUSPECT | caution | A declared dependency name is one small edit from a very popular package name (transposed letters, swapped separator, look-alike character) — the typosquatting shape. Compared offline against curated top-package lists (`skillscan/toplists/`); known legitimate near-miss packages are never flagged |
 | HIDDEN_TEXT | block / caution | Concealed text: zero-width or bidirectional control characters, Unicode Tags-block payloads (BLOCK when the decoded payload contains instruction keywords), or HTML comments carrying instruction-like content. A single zero-width joiner in ordinary multilingual text does not fire |
-| NON_ENGLISH_INSTRUCTION | caution | Instruction-attack phrases in 14 other languages (override / send-the-credentials / keep-it-from-the-user shapes) — a phrase list, not language understanding. The lists are data files (`skillscan/phrases/<code>.json`): adding a language = adding one file |
+| NON_ENGLISH_INSTRUCTION | caution | Instruction-attack phrases in 15 other languages (override / send-the-credentials / keep-it-from-the-user shapes) — a phrase list, not language understanding. The lists are data files (`skillscan/phrases/<code>.json`): adding a language = adding one file |
 | ANY_LANGUAGE_STRUCTURE | caution | An instruction surface in ANY language pairs a private credential store (`~/.ssh`, `~/.aws`, a `.env` file, a browser credential store) with an outbound destination (URL, IP, email, curl/wget, webhook). Normal integration guides (your own token → the service's API URL) and safety warnings do not fire |
 | MARKDOWN_CONCEALMENT | caution | Content hidden from a rendered view (display:none, visibility:hidden, white-on-white, off-screen positioning, hidden attribute) that contains instruction-grade wording. A plain `<details>` disclosure block does not fire on its own |
 | SUBSTITUTION_EXEC | block / caution | Executes a download via shell substitution: `$(curl …)`, backtick curl/wget, `<(curl …)` (BLOCK in code files). A substitution that only captures the download into a variable that is never executed — e.g. a Makefile `$(shell …)` assignment — is CAUTION, and so is the executing form shown inside documentation, where it is a code-fence example rather than code that runs (v0.4 precision fix) |
@@ -254,7 +254,7 @@ challenges it, by design of static analysis:
 - **Concealment and phrase checks are mechanics, not meaning.**
   `HIDDEN_TEXT` / `MARKDOWN_CONCEALMENT` detect invisible characters
   and hidden elements; `NON_ENGLISH_INSTRUCTION` matches a fixed
-  phrase list in 14 languages. None of them understands what prose
+  phrase list in 15 languages. None of them understands what prose
   *means*: a novel phrasing, an uncovered language, or a purely
   semantic deception still passes — see the coverage map's Gap B.
   Ordinary multilingual text is deliberately protected (single
@@ -399,7 +399,7 @@ targets, Cursor-rules handling, repo-URL scanning, SARIF output, and
 toolchain integration (GitHub Action + pre-install hook). v0.3 adds
 concealment mechanics (zero-width / Unicode Tags / BiDi characters,
 instruction-carrying HTML comments, Markdown hiding places),
-non-English instruction phrases in 14 languages, shell-substitution
+non-English instruction phrases in 15 languages, shell-substitution
 execution, sends through session/client objects, compiled-code
 coverage honesty (bytecode or native binaries with no inspectable
 source can no longer read as clean), environment-injection shapes
