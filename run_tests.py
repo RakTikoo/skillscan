@@ -19,6 +19,7 @@ ROOT = Path(__file__).parent
 # sample path -> (expected verdict, expected exit code)
 EXPECTED = {
     "samples/good/calendar-helper": ("PASS", 0),
+    "samples/good/file-organiser": ("PASS", 0),
     "samples/good/notes-summariser": ("PASS", 0),
     "samples/bad/ssh-stealer": ("BLOCK", 2),
     "samples/bad/obfuscated-dropper": ("BLOCK", 2),
