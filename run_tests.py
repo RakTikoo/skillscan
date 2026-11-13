@@ -22,6 +22,7 @@ EXPECTED = {
     "samples/good/file-organiser": ("PASS", 0),
     "samples/good/notes-summariser": ("PASS", 0),
     "samples/good/expense-summariser": ("PASS", 0),
+    "samples/good/unit-converter": ("PASS", 0),
     "samples/bad/ssh-stealer": ("BLOCK", 2),
     "samples/bad/obfuscated-dropper": ("BLOCK", 2),
     # Legit-sounding backup skill: runs subprocess + deletes old files.
