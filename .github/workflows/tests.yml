@@ -46,3 +46,5 @@ jobs:
         run: python3 run_v06fix_tests.py
       - name: v0.6 fix wave 2 (demotion hardening, folder mediation, resolver/verb gaps, audit-2 perf + stale-token)
         run: python3 run_v06fix2_tests.py
+      - name: v0.7 features (optional LLM review mode, stub provider — no live API in CI)
+        run: python3 run_v07_tests.py
