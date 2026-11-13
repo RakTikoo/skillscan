@@ -6,8 +6,11 @@ AI-agent skills and MCP servers run on your machine, with your agent's
 permissions — your files, your accounts, your keys. SkillScan reads a
 skill folder *before* you install it and gives you one plain-English
 verdict — **BLOCK**, **CAUTION**, or **PASS** — from deterministic rules.
-No LLM decides the verdict: the same folder always gets the same answer,
-and every finding points at the exact rule, file, and line.
+By default no LLM is involved: the same folder always gets the same
+answer, and every finding points at the exact rule, file, and line.
+An optional LLM review mode (`--llm`, off by default) can *add*
+findings on top — it can never remove or change them; see
+[Modes](#modes-offline-default-and-llm-review-opt-in).
 
 SkillScan is free and open source (MIT). There is no hosted tier and no
 paid version — the whole tool lives in this repository.
@@ -60,6 +63,7 @@ python3 -m skillscan <path-to-skill-folder> --format json # machine-readable
 python3 -m skillscan <path-to-skill-folder> --format sarif # SARIF 2.1.0 (toolchains)
 python3 -m skillscan https://github.com/<owner>/<repo>   # clone + scan a repo
 python3 skillscan.py <path-to-skill-folder>               # shim, same thing
+python3 -m skillscan <path-to-skill-folder> --llm         # + optional LLM review (see Modes)
 ```
 
 Repo URLs: only `https://github.com/<owner>/<repo>` is accepted.
@@ -112,6 +116,105 @@ cannot be a clean PASS (`SCAN_INCOMPLETE`).
 | 3         | —        | Usage / IO error: the scanner could not run (bad path, bad flags). Deliberately distinct from BLOCK. |
 
 The exit codes make SkillScan usable as a CI / install-time gate.
+
+## Modes: offline (default) and LLM review (opt-in)
+
+SkillScan has two modes, and the report always shows which one ran.
+
+**Offline mode — the default.** Exactly what is described above:
+deterministic rules only, nothing leaves your machine, no account or
+key, and the same folder always gets the same verdict. If you never
+pass `--llm`, this is the whole tool — its output is unchanged from
+v0.6, byte for byte.
+
+**LLM mode — `--llm`.** After the offline scan (which runs first and
+is never altered), the skill's *prose* — `SKILL.md` and
+markdown/docs, never code — is sent to a language model for a second
+opinion on the one family deterministic rules measurably cannot
+finish: **semantic steering**, prose that tells the agent to mislead
+you (report success on failure, hide errors, fabricate results,
+present an advert as neutral advice). Files whose prose already drew
+a deterministic CAUTION are reviewed first.
+
+```bash
+export SKILLSCAN_LLM_API_KEY=<your key>
+python3 -m skillscan <path-to-skill-folder> --llm
+python3 -m skillscan <path-to-skill-folder> --llm --llm-model qwen/qwen3.8-27b
+```
+
+The LLM mode is **provider-neutral by design**: one
+OpenAI-compatible chat-completions client, configured by exactly
+three settings — `--llm-base-url`, `--llm-model`, and the key in
+`SKILLSCAN_LLM_API_KEY`. There is no provider-specific code path.
+The shipped defaults are simply the **reference preset** (Groq's
+free tier with a small model), because that is the configuration
+the mode is measured against; every other row below is the same
+client pointed elsewhere. (Only for the Groq preset,
+`GROQ_API_KEY` is also accepted as the key variable — it is never
+sent to any other host.)
+
+| Provider | `--llm-base-url` | `--llm-model` | Key |
+|---|---|---|---|
+| Groq — reference preset, free tier | `https://api.groq.com/openai/v1` (default) | `qwen/qwen3.8-27b` (default) | `SKILLSCAN_LLM_API_KEY` or `GROQ_API_KEY` |
+| OpenRouter (`:free` models) | `https://openrouter.ai/api/v1` | any `:free` model id | `SKILLSCAN_LLM_API_KEY` |
+| Cerebras (free tier) | `https://api.cerebras.ai/v1` | e.g. `llama3.1-8b` | `SKILLSCAN_LLM_API_KEY` |
+| Gemini (OpenAI-compatible endpoint) | `https://generativelanguage.googleapis.com/v1beta/openai/` | e.g. `gemini-3.5-flash-lite` (measured on the bake-off sets) | `SKILLSCAN_LLM_API_KEY` |
+| OpenAI | `https://api.openai.com/v1` | e.g. `gpt-4o-mini` | `SKILLSCAN_LLM_API_KEY` |
+| Ollama (local, no account, nothing leaves your machine) | `http://localhost:11434/v1` | any pulled model, e.g. `llama3.1:8b` | any dummy value in `SKILLSCAN_LLM_API_KEY` (ignored locally) |
+| LM Studio / vLLM (local server) | e.g. `http://localhost:1234/v1` | the served model id | any dummy value in `SKILLSCAN_LLM_API_KEY` (ignored locally) |
+
+The Groq reference preset is the configuration SkillScan's
+release measurements headline; the Gemini row's named model was
+additionally measured on the v0.7 bake-off sets. The remaining
+rows are documented provider endpoints for the same client, not
+separately benchmarked configurations.
+
+The contract:
+
+- **Additive only.** The LLM can add findings (rule `LLM_STEERING`,
+  CAUTION or BLOCK). It can never clear, downgrade, or edit an
+  offline finding or the offline verdict.
+- **Demarcated output.** Every format shows the offline verdict
+  first, then a separate, headed **LLM review** section naming the
+  model and carrying a non-determinism notice, then the
+  **combined verdict** — `max(offline, llm)`, labelled with its
+  source. The process exit code follows the combined verdict. In
+  JSON, the offline fields are unchanged and the review is one
+  added `llm` object.
+- **Failure is boring.** No key, network error, timeout, or a
+  response outside the required JSON schema → the LLM section
+  reports **UNAVAILABLE** with the reason, the offline verdict
+  stands, and the exit code is the offline one. Hard timeouts and
+  size caps throughout; the key comes from the environment only
+  and is never printed or logged. Cross-host redirects are
+  refused, so the key is never forwarded away from the endpoint
+  you configured. In JSON and SARIF the `llm` object's `verdict`
+  field is `null` whenever the review was unavailable or fully
+  reviewed no file — "not reviewed" is never dressed up as a
+  pass. Coverage is reported per chunk: anything the review did
+  not reach (file caps, chunk caps, budget) is named, never
+  silently skipped.
+- **The scanned prose is treated as hostile.** It is sent as
+  delimited *data* under an untrusted-data framing (skills are
+  written by strangers and may beg the judge to pass them), the
+  judge must answer in a fixed JSON schema, and a steering claim
+  is believed only when its evidence quote is verifiably present
+  in the text that was sent.
+- **Non-deterministic.** The same folder can get a different LLM
+  opinion on a re-run. That is exactly why this mode is opt-in,
+  additive, and labelled — and why the offline verdict is always
+  shown separately.
+
+Still standard library only (`urllib`), still no execution of
+scanned code. Live-model measurement so far: on the benchmark's
+output-manipulation family, a current-model judge lifts
+BLOCK+CAUTION from 28.9% to 54.6% with zero false BLOCKs on
+280 benign skills, and weak free-tier judges lift the held-out
+malicious set materially (Gemini Flash-Lite 37.0% → 53.4%;
+the default Qwen 34.1% → 43.2%). The benign set under a weak
+judge is still being measured — that run completes the v0.7
+picture. The deterministic benchmark figures below are
+offline-mode numbers and do not change.
 
 ## Toolchain integration
 
@@ -188,7 +291,7 @@ triage metadata only and never affects the verdict.
 | SECRET_FLOW | caution | A secret-named environment variable's value flows into a request **body**. A service's own token in its own `Authorization` header is ordinary and does not fire |
 | TYPOSQUAT_SUSPECT | caution | A declared dependency name is one small edit from a very popular package name (transposed letters, swapped separator, look-alike character) — the typosquatting shape. Compared offline against curated top-package lists (`skillscan/toplists/`); known legitimate near-miss packages are never flagged |
 | HIDDEN_TEXT | block / caution | Concealed text: zero-width or bidirectional control characters, Unicode Tags-block payloads (BLOCK when the decoded payload contains instruction keywords), or HTML comments carrying instruction-like content. A single zero-width joiner in ordinary multilingual text does not fire |
-| NON_ENGLISH_INSTRUCTION | caution | Instruction-attack phrases in 15 other languages (override / send-the-credentials / keep-it-from-the-user shapes) — a phrase list, not language understanding. The lists are data files (`skillscan/phrases/<code>.json`): adding a language = adding one file |
+| NON_ENGLISH_INSTRUCTION | caution | Instruction-attack phrases in 14 other languages (override / send-the-credentials / keep-it-from-the-user shapes) — a phrase list, not language understanding. The lists are data files (`skillscan/phrases/<code>.json`): adding a language = adding one file |
 | ANY_LANGUAGE_STRUCTURE | caution | An instruction surface in ANY language pairs a private credential store (`~/.ssh`, `~/.aws`, a `.env` file, a browser credential store) with an outbound destination (URL, IP, email, curl/wget, webhook). Normal integration guides (your own token → the service's API URL) and safety warnings do not fire |
 | MARKDOWN_CONCEALMENT | caution | Content hidden from a rendered view (display:none, visibility:hidden, white-on-white, off-screen positioning, hidden attribute) that contains instruction-grade wording. A plain `<details>` disclosure block does not fire on its own |
 | SUBSTITUTION_EXEC | block / caution | Executes a download via shell substitution: `$(curl …)`, backtick curl/wget, `<(curl …)` (BLOCK in code files). A substitution that only captures the download into a variable that is never executed — e.g. a Makefile `$(shell …)` assignment — is CAUTION, and so is the executing form shown inside documentation, where it is a code-fence example rather than code that runs (v0.4 precision fix) |
@@ -256,7 +359,7 @@ challenges it, by design of static analysis:
 - **Concealment and phrase checks are mechanics, not meaning.**
   `HIDDEN_TEXT` / `MARKDOWN_CONCEALMENT` detect invisible characters
   and hidden elements; `NON_ENGLISH_INSTRUCTION` matches a fixed
-  phrase list in 15 languages. None of them understands what prose
+  phrase list in 14 languages. None of them understands what prose
   *means*: a novel phrasing, an uncovered language, or a purely
   semantic deception still passes — see the coverage map's Gap B.
   Ordinary multilingual text is deliberately protected (single
@@ -404,7 +507,7 @@ targets, Cursor-rules handling, repo-URL scanning, SARIF output, and
 toolchain integration (GitHub Action + pre-install hook). v0.3 adds
 concealment mechanics (zero-width / Unicode Tags / BiDi characters,
 instruction-carrying HTML comments, Markdown hiding places),
-non-English instruction phrases in 15 languages, shell-substitution
+non-English instruction phrases in 14 languages, shell-substitution
 execution, sends through session/client objects, compiled-code
 coverage honesty (bytecode or native binaries with no inspectable
 source can no longer read as clean), environment-injection shapes

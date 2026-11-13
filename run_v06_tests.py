@@ -95,7 +95,7 @@ def tier(r, rule: str) -> str | None:
 
 
 print("== registry ==")
-check("version is 0.6.0", __version__ == "0.6.0", __version__)
+check("version is 0.7.0", __version__ == "0.7.0", __version__)
 check("59 rules registered", len(_RULE_LIST) == 59,
       str(len(_RULE_LIST)))
 for rid in sorted(NEW_RULES):

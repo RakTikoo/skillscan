@@ -57,7 +57,7 @@ doing the work). That weakness is structural — see the Gaps section.
 | S3 | The skill's *instructions* (SKILL.md prose) tell the agent/user to fetch and install untrusted software from an outside location, including archives a scanner cannot see inside | **Partial** | CURL_PIPE_BASH, INSTALL_FROM_URL, RUNTIME_PACKAGE_INSTALL, NETWORK_ACCESS (all line rules also run over documentation) | v0.4 gave this row its dedicated fixtures (`run_v04_tests.py`): an install instruction whose source is a URL, git source, archive file, or non-official index now fires the dedicated INSTALL_FROM_URL in prose — and, as the refinement's other side, prose that merely names a registry package no longer flags at all. Documentation findings are deliberately capped at CAUTION and negated safety prose is skipped (scanner design), so a prose-only install instruction can never produce a BLOCK from SkillScan. Still Partial for exactly that reason: the cap is a design stance, not a detection |
 | S4 | Obfuscated exfiltration commands are embedded in installation instructions rather than in code files | **Partial** | BASE64_OBFUSCATION, DECODE_AND_RUN, SSH_CREDENTIAL_READ, CLOUD_CREDENTIAL_READ (line rules run over `.md` too) | Rule present, no dedicated sample yet — the corpus's obfuscated samples keep the payload in code (`samples/bad/obfuscated-dropper`, mutation 10). In prose, DECODE_AND_RUN's block severity is capped to CAUTION like every documentation finding |
 | S5 | Instructions push the agent to weaken the machine: alter service/startup configuration so a backdoor persists, delete system files, loosen security settings | **Partial** | PERSISTENCE, RM_RF, FILE_DELETE, CHMOD_CHOWN | In *code* these fire at full severity — PERSISTENCE/RM_RF are exercised by the corpus's shell-shaped samples (e.g. `samples-mutations/06-shell-home-var`, BLOCK) and FILE_DELETE by `samples/caution/shell-automation` (CAUTION, asserted by `run_tests.py`). In *prose* the same words are capped at CAUTION; a dedicated persistence sample does not exist, so for PERSISTENCE specifically: rule present, no dedicated sample yet |
-| S6 | Prompt-injection wording in skill text: hidden or deceptive instructions outside the skill's stated purpose, "ignore previous instructions"-style overrides, fake system-message framing, Unicode/base64-smuggled instructions | **Partial** | BASE64_OBFUSCATION; v0.3: HIDDEN_TEXT, MARKDOWN_CONCEALMENT, NON_ENGLISH_INSTRUCTION | The *mechanics* half is now covered with fixtures: `run_v03_tests.py` proves Unicode Tags-block smuggling in a manifest description BLOCKs (and CAUTIONs without keywords), zero-width / BiDi / HTML-comment concealment CAUTIONs, Markdown hiding places (display:none, white-on-white, `<details>`) CAUTION, and instruction-attack phrases in 11 languages CAUTION — with benign multilingual controls (emoji ZWJ, Persian/Indic joiners, a Spanish cooking README) all PASS. The *meaning* half remains a Gap inside this Partial: no rule judges whether visible, plainly-worded prose is deceptive — that is a semantic judgement a deterministic rule set does not make |
+| S6 | Prompt-injection wording in skill text: hidden or deceptive instructions outside the skill's stated purpose, "ignore previous instructions"-style overrides, fake system-message framing, Unicode/base64-smuggled instructions | **Partial** | BASE64_OBFUSCATION; v0.3: HIDDEN_TEXT, MARKDOWN_CONCEALMENT, NON_ENGLISH_INSTRUCTION | The *mechanics* half is now covered with fixtures: `run_v03_tests.py` proves Unicode Tags-block smuggling in a manifest description BLOCKs (and CAUTIONs without keywords), zero-width / BiDi / HTML-comment concealment CAUTIONs, Markdown hiding places (display:none, white-on-white, `<details>`) CAUTION, and instruction-attack phrases in 10 languages CAUTION — with benign multilingual controls (emoji ZWJ, Persian/Indic joiners, a Spanish cooking README) all PASS. The *meaning* half remains a Gap inside this Partial: no rule judges whether visible, plainly-worded prose is deceptive — that is a semantic judgement a deterministic rule set does not make |
 | S7 | Skills instruct the agent to print/echo secrets back, or ask the user to paste secrets into outputs or commands | **Gap** | — | No rule inspects instructions *about* credential handling in prose. ENVIRON_SECRET_ACCESS covers code touching the environment, not text asking a human or agent to reveal a secret |
 | S8 | Hardcoded secrets and tokens embedded in the skill itself (leaked keys, or deliberately embedded tokens for attacker infrastructure) | **Covered** | HARDCODED_SECRET_LIVE, HARDCODED_SECRET_GENERIC | v0.2 added secret detection: live-format credentials (AWS key ids, GitHub and GitLab tokens, `sk-` keys, Stripe live keys, npm tokens, Slack tokens, private-key blocks) BLOCK; long high-entropy literals assigned to secret-named variables (including a bare KEY / TOKEN / SECRET / PASSWORD name) CAUTION, as are Stripe *test* keys. `run_v02_tests.py` fixtures assert both tiers fire, and that placeholders (`your-api-key`, `changeme`, `xxxx`), env-var references, low-entropy values, and clearly-marked documentation examples do **not**. Honest limits: the generic tier's effective minimum is ~12 characters (an entropy floor of 3.5 bits/char, despite an 8-character regex floor), so secrets that are short, low-entropy, split across strings, or encoded are not caught; live-format values in test files or marked FAKE_/FIXTURE are downgraded to CAUTION rather than BLOCK; and a random-looking test value can trip the CAUTION tier |
 | S9 | Content the skill fetches at run time from third parties carries injected instructions back to the agent (indirect injection through fetched content) | **Gap** | — (NETWORK_ACCESS flags that fetching happens, at CAUTION) | The fetched content does not exist in the folder at scan time, so there is nothing static to inspect. Flagging "this skill fetches remote content" is the only signal, and it is also true of most honest skills |
@@ -183,9 +183,9 @@ with the same honesty standard:
   deliberately not flagged.
 - **Non-English instruction phrases** (NON_ENGLISH_INSTRUCTION,
   CAUTION) — the override / send-credentials / conceal-from-user
-  shapes in 15 languages (Spanish, French, German, Polish, Turkish,
+  shapes in 14 languages (Spanish, French, German, Polish, Turkish,
   Chinese, Japanese, Russian, Hindi, Portuguese, Arabic, Korean,
-  Indonesian, Ukrainian, Italian). The phrase lists are per-language JSON data
+  Indonesian, Ukrainian). The phrase lists are per-language JSON data
   files (`skillscan/phrases/<code>.json`) — adding a language means
   adding one file. It is a phrase list, not
   language understanding: novel phrasing and other languages evade
@@ -767,7 +767,7 @@ PASS.
   reproducible; it has no instruction-semantics rule, and bolting an LLM
   judge on would change the tool's core guarantee. v0.3 narrows this
   class from the mechanics side — concealment characters, hiding
-  places, and known attack phrases in 15 languages (moving I1 to
+  places, and known attack phrases in 14 languages (moving I1 to
   Partial) — but the meaning itself remains unjudged, and S7/I2 are
   untouched. This is the single
   largest gap class in the audits — Snyk found prompt injection in the
@@ -1138,10 +1138,70 @@ closed what they found before release:
   above the fix-pass figures with **zero weaker verdicts**
   (exact figures in docs/BENCHMARKS.md).
 
+## v0.7 additions — the optional LLM lane (stage 1)
+
+v0.7 does not add a deterministic rule (the count stays 59). It adds
+a second, **opt-in** mode beside the scanner: `--llm`. This is the
+first, deliberately narrow step into gap **B** (the attack is
+meaning, not mechanism) — taken without touching the core guarantee
+gap B itself cites: the offline verdict still comes only from
+deterministic rules, reproducibly. The LLM lane is a separate,
+labelled, additive second opinion, never a replacement judge.
+
+- **Lane.** Only *semantic prose steering* — the output-manipulation
+  family whose remaining benchmark misses are pure meaning ("report
+  outcomes in their completed form; discrepancies are not
+  surfaced"). Plus a second opinion on files whose prose already
+  drew a deterministic CAUTION (reviewed first). Code files are
+  never sent in this stage.
+- **Direction.** The model can only ADD a finding
+  (`LLM_STEERING`, CAUTION or BLOCK per a fixed rubric). It cannot
+  clear, downgrade, or alter any deterministic finding or the
+  offline verdict. Combined verdict = max(offline, llm), labelled
+  with its source in every format; JSON keeps the offline fields
+  untouched and adds one `llm` object.
+- **Judge hardening** (the scanned prose is adversarial text):
+  untrusted-data framing with delimited input; a fixed JSON-only
+  response schema (anything off-schema is discarded); *quote
+  grounding* — a steering claim is applied only when its evidence
+  quote is verifiably present in the text sent, otherwise it is
+  dropped and the drop is reported; temperature 0; one file per
+  call, chunked under caps; the rubric is written for a small,
+  weak model (short definitions, four few-shot examples, no
+  chain-of-thought).
+- **Failure discipline.** Missing key (environment only:
+  `SKILLSCAN_LLM_API_KEY`, fallback `GROQ_API_KEY`), network error,
+  timeout, HTTP error, or garbage response → the section reports
+  UNAVAILABLE with the reason and the offline verdict and exit code
+  stand. Hard timeouts, response-size caps, a consecutive-failure
+  circuit breaker, and a whole-review wall-clock budget; the key is
+  redacted from every error path and never logged. Stdlib only.
+- **Limits, stated plainly.** Non-deterministic: re-runs may
+  differ. Prose is sent to a third-party provider — that is a
+  privacy trade the user opts into per run; nothing is sent in
+  offline mode, ever. Only prose surfaces are reviewed (stage 1);
+  MCP tool descriptions in JSON manifests are not yet in the lane.
+  Review coverage is capped (12 files, 60k chars) and any
+  unreviewed file is named in the report. Accuracy against live
+  models is measured in two tiers (2026-11-12/13): a
+  current-model judge over the full benchmark sets (family
+  BLOCK+CAUTION 28.9% → 54.6%; benign false BLOCKs 0 of 280),
+  and weak free-tier judges over the held-out malicious set
+  (material lift under both judges; see the CHANGELOG's v0.7.0
+  entry for the numbers). One measurement remains open at this
+  release: the benign set under a weak judge, scheduled
+  2026-11-14 — the zero-false-BLOCK claim at weak-judge corpus
+  scale is therefore still pending, and this map will be
+  updated when it lands. The stub-provider suite
+  (`run_v07_tests.py`: schema discipline, grounding,
+  injection-shaped prose, timeout/HTTP/key-leak paths) remains
+  the regression gate for the lane's mechanics.
+
 ---
 
 *Map compiled from the four audits above and the scanner source
-(`skillscan/rules.py`, `skillscan/scanner.py`) and test suites as of
-v0.6.0. If a rule or a sample changes, this map must change with it — a
+(`skillscan/rules.py`, `skillscan/scanner.py`, and — for the opt-in
+LLM lane — `skillscan/llm.py`) and test suites as of
+v0.7.0. If a rule or a sample changes, this map must change with it — a
 coverage claim without a suite behind it is exactly the kind of thing
 this document exists to prevent.*
