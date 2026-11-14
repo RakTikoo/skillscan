@@ -557,3 +557,8 @@ names, setup.py, and Cyrillic-lookalike names. Expect false
 positives and false negatives; the rule set and corpus are the starting
 point, not the finished product. Issues and new evasion samples are
 welcome — a mutation that evades SkillScan is a valuable contribution.
+
+
+---
+
+**More from this workshop:** [KiCad Preflight](https://github.com/RakTikoo/kicad-preflight) · [Expiry Radar](https://github.com/RakTikoo/expiry-radar) · [CI Command Truth](https://github.com/RakTikoo/ci-command-truth) · [PhantomDep PR Gate](https://github.com/RakTikoo/phantomdep-pr-gate) · [Stranger Suite](https://github.com/RakTikoo/stranger-suite) · [Living Contract Diff](https://github.com/RakTikoo/living-contract-diff) · [Handoff Reconciler](https://github.com/RakTikoo/handoff-reconciler)
