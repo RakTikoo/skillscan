@@ -25,6 +25,9 @@ EXPECTED = {
     # Legit-sounding backup skill: runs subprocess + deletes old files.
     # No block-severity rule fires, so the documented expectation is CAUTION.
     "samples/caution/shell-automation": ("CAUTION", 1),
+    # Legit-sounding batch renamer: runs subprocess + deletes old files.
+    # Same shape — CAUTION, not BLOCK.
+    "samples/caution/batch-renamer": ("CAUTION", 1),
 }
 
 # Rules that must fire for a sample (checked on top of the verdict).
@@ -32,6 +35,7 @@ MUST_FIRE = {
     "samples/bad/ssh-stealer": {"SSH_CREDENTIAL_READ", "NETWORK_SEND_DATA"},
     "samples/bad/obfuscated-dropper": {"EVAL_EXEC", "DECODE_AND_RUN", "CURL_PIPE_BASH"},
     "samples/caution/shell-automation": {"SHELL_SUBPROCESS", "FILE_DELETE"},
+    "samples/caution/batch-renamer": {"SHELL_SUBPROCESS", "FILE_DELETE"},
 }
 
 
