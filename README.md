@@ -2,6 +2,8 @@
 
 Scan an AI-agent skill or MCP server before you install it.
 
+![SkillScan scanning two sample skills — a malicious one is BLOCKed, a clean one PASSes](demo.gif)
+
 AI-agent skills and MCP servers run on your machine, with your agent's
 permissions — your files, your accounts, your keys. SkillScan reads a
 skill folder *before* you install it and gives you one plain-English
